@@ -1,0 +1,3 @@
+[submodule "nav_graph_gpu"]
+	path = nav_graph_gpu
+	url = https://github.com/GoldenGait/nav_graph_gpu
