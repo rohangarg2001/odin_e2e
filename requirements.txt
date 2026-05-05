@@ -1,0 +1,23 @@
+# Editable installs — run these two lines after creating the venv:
+#   uv pip install --no-build-isolation -e elevation_mapping_cupy/elevation_mapping_cupy
+#   uv pip install -e nav_graph_gpu
+
+# Core dependencies
+numpy>=1.24
+scipy>=1.10
+networkx>=3.0
+opencv-python>=4.8
+torch>=2.0
+cupy-cuda12x>=12.0
+torch-geometric>=2.4
+
+# elevation_mapping_cupy dependencies
+simple-parsing
+ruamel.yaml
+scikit-image
+matplotlib
+shapely
+catkin-pkg
+
+# ROS2 packages (rclpy, sensor_msgs, nav_msgs, etc.) come from the system
+# via --system-site-packages; do NOT add them here.

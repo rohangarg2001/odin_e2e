@@ -18,6 +18,9 @@ Pipeline per cloud message:
 
 All published topics live in the ``odom`` frame so RViz only needs the
 fixed frame set to ``odom``.
+
+ros2 run odin_nav_graph nav_graph_node   --ros-args   -p out_directory:=/home/rohang73/Documents/odin_e2e/saved_outputs_odin   -p cam_fx:=800.0   -p cam_fy:=800.0   -p cam_cx:=800.0   -p cam_cy:=648.0 -p map_length_xy:=30.0 -p cloud_max_range:=15.0
+
 """
 
 from __future__ import annotations
@@ -36,11 +39,16 @@ import rclpy
 import torch
 from rclpy.node import Node
 
-from sensor_msgs.msg import PointCloud2, PointField
+from sensor_msgs.msg import PointCloud2, PointField, Image, CameraInfo
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Header
 from visualization_msgs.msg import Marker
 from geometry_msgs.msg import Point
+import base64
+import cv2
+import json
+from pathlib import Path
+from scipy.spatial.transform import Rotation as _ScipyR
 
 # Allow running without pip-installing nav_graph by adding the sibling
 # ``nav_graph_gpu`` checkout to sys.path.  Pip-installed nav_graph wins.
@@ -301,6 +309,71 @@ def _install_builder_patches(builder) -> None:
     )
 
 
+def _pq_to_se3(translation: np.ndarray, quaternion_xyzw: np.ndarray) -> np.ndarray:
+    """4×4 float64 SE3 from translation (3,) and unit quaternion (x,y,z,w)."""
+    se3 = np.eye(4, dtype=np.float64)
+    se3[:3, :3] = _ScipyR.from_quat(quaternion_xyzw).as_matrix()
+    se3[:3, 3] = translation
+    return se3
+
+
+def _rgb_to_b64png(rgb: np.ndarray) -> str:
+    """Encode an HxWx3 RGB array as a base64-encoded PNG string."""
+    _, buf = cv2.imencode('.png', cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+    return base64.b64encode(buf.tobytes()).decode()
+
+
+def _save_svg_plain(path: Path, rgb: np.ndarray) -> None:
+    h, w = rgb.shape[:2]
+    b64 = _rgb_to_b64png(rgb)
+    path.write_text(
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}">\n'
+        f'<image href="data:image/png;base64,{b64}" width="{w}" height="{h}"/>\n'
+        f'</svg>\n'
+    )
+
+
+def _node_circles(nodes: list) -> list:
+    parts = []
+    for node in nodes:
+        u, v = node['pixel']
+        color = '#ffff00' if node['type'] == 'frontier' else '#0000ff'
+        r = 7 if node['type'] == 'frontier' else 5
+        parts.append(f'<circle cx="{u}" cy="{v}" r="{r}" fill="{color}" opacity="0.85"/>')
+    return parts
+
+
+def _save_svg_overlay(path: Path, rgb: np.ndarray, nodes: list) -> None:
+    h, w = rgb.shape[:2]
+    b64 = _rgb_to_b64png(rgb)
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}">',
+        f'<image href="data:image/png;base64,{b64}" width="{w}" height="{h}"/>',
+    ] + _node_circles(nodes) + ['</svg>']
+    path.write_text('\n'.join(parts))
+
+
+def _save_svg_edges(path: Path, rgb: np.ndarray, nodes: list, edges: list) -> None:
+    h, w = rgb.shape[:2]
+    b64 = _rgb_to_b64png(rgb)
+    id_to_px = {n['id']: n['pixel'] for n in nodes}
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}">',
+        f'<image href="data:image/png;base64,{b64}" width="{w}" height="{h}"/>',
+    ]
+    for edge in edges:
+        p0 = id_to_px.get(edge['node_id_0'])
+        p1 = id_to_px.get(edge['node_id_1'])
+        if p0 and p1:
+            parts.append(
+                f'<line x1="{p0[0]}" y1="{p0[1]}" x2="{p1[0]}" y2="{p1[1]}"'
+                f' stroke="#ffffff" stroke-width="1.5" opacity="0.6"/>'
+            )
+    parts += _node_circles(nodes)
+    parts.append('</svg>')
+    path.write_text('\n'.join(parts))
+
+
 # ─────────────────────────────────────────────────────────────────────
 #  Node
 # ─────────────────────────────────────────────────────────────────────
@@ -341,14 +414,15 @@ class OdinNavGraphNode(Node):
         self.declare_parameter('minimum_points_in_cluster', 1)
 
         # Elevation -> traversability params
-        self.declare_parameter('elev_max_height_diff', 0.2)
+        self.declare_parameter('elev_max_height_diff', 0.3)
         self.declare_parameter('elev_max_slope', 0.5)
         self.declare_parameter('elev_gaussian_sigma', 0.5)
         self.declare_parameter('elev_window_size', 5)
-        self.declare_parameter('elev_border_cells', 5)
+        self.declare_parameter('elev_border_cells', 0)
 
         # Throttling / publishing
         self.declare_parameter('process_every_n', 1)
+        self.declare_parameter('max_cloud_frames', 385)   # 0 = unlimited; stop graph updates after N frames
         self.declare_parameter('publish_elevation_cloud', True)
         self.declare_parameter('publish_edges', True)
         self.declare_parameter('max_edges_published', 100000)
@@ -368,6 +442,27 @@ class OdinNavGraphNode(Node):
         # the global graph is unchanged.
         self.declare_parameter('viz_z_offset', 0.45)
 
+        # RGB + graph saver
+        self.declare_parameter('out_directory', '')
+        self.declare_parameter('save_every_n_frames', 5)
+        self.declare_parameter('save_frame_start', 100)   # first _rgb_count to save (80*20)
+        self.declare_parameter('save_frame_end',   385)   # last  _rgb_count to save (120*20)
+        self.declare_parameter('cam_image_topic', '/odin1/image/undistorted')
+        self.declare_parameter('cam_info_topic', '/odin1/camera_info')
+        self.declare_parameter('cam_frame', 'camera_optical')  # label for JSON only
+        self.declare_parameter('cam_fx', 0.0)
+        self.declare_parameter('cam_fy', 0.0)
+        self.declare_parameter('cam_cx', 0.0)
+        self.declare_parameter('cam_cy', 0.0)
+        # Static camera-to-base_link extrinsic (Odin Nav Stack defaults)
+        self.declare_parameter('cam_base_tx', -0.0042)
+        self.declare_parameter('cam_base_ty',  0.0328)
+        self.declare_parameter('cam_base_tz',  0.0005)
+        self.declare_parameter('cam_base_qx', -0.4951)
+        self.declare_parameter('cam_base_qy',  0.5048)
+        self.declare_parameter('cam_base_qz', -0.4996)
+        self.declare_parameter('cam_base_qw',  0.5005)
+
         gp = lambda n: self.get_parameter(n).value  # noqa: E731
         cloud_topic = gp('cloud_topic')
         odom_topic = gp('odom_topic')
@@ -383,6 +478,7 @@ class OdinNavGraphNode(Node):
         self.odom_buffer_seconds = float(gp('odom_buffer_seconds'))
         self.odom_match_max_dt = float(gp('odom_match_max_dt'))
         self.process_every_n = int(gp('process_every_n'))
+        self.max_cloud_frames = int(gp('max_cloud_frames'))
         self.publish_elevation_cloud = bool(gp('publish_elevation_cloud'))
         self.publish_edges_flag = bool(gp('publish_edges'))
         self.max_graph_nodes_before_reset = int(gp('max_graph_nodes_before_reset'))
@@ -397,6 +493,8 @@ class OdinNavGraphNode(Node):
             merge_node_distance=float(gp('merge_node_distance')),
             global_merge_distance=float(gp('global_merge_distance')),
             global_max_candidate_edge_distance=float(gp('global_max_candidate_edge_distance')),
+            global_max_candidate_edge_search_distance = 100,
+            global_max_connections = 12,
             frontier=FrontierConfig(
                 kernel_size=int(gp('frontier_kernel_size')),
                 odom_proximity_threshold=float(gp('frontier_odom_threshold')),
@@ -458,6 +556,54 @@ class OdinNavGraphNode(Node):
         self.frontier_pub = self.create_publisher(PointCloud2, '~/frontier_cloud', 1)
         self.edges_pub = self.create_publisher(Marker, '~/graph_edges', 1)
 
+        # ── RGB + graph saver ─────────────────────────────────────────
+        self._save_every_n = int(gp('save_every_n_frames'))
+        self._save_frame_start = int(gp('save_frame_start'))
+        self._save_frame_end   = int(gp('save_frame_end'))
+        self._rgb_count = 0
+        self._last_result = None
+
+        out_dir_str = str(gp('out_directory')).strip()
+        self._out_dir: Optional[Path] = Path(out_dir_str) if out_dir_str else None
+        if self._out_dir:
+            self._out_dir.mkdir(parents=True, exist_ok=True)
+            self.get_logger().info(f'RGB+graph saver enabled → {self._out_dir}')
+
+        cam_fx = float(gp('cam_fx'))
+        cam_fy = float(gp('cam_fy'))
+        cam_cx = float(gp('cam_cx'))
+        cam_cy = float(gp('cam_cy'))
+        if cam_fx > 0.0 and cam_fy > 0.0:
+            self._cam_K: Optional[np.ndarray] = np.array(
+                [[cam_fx, 0.0, cam_cx], [0.0, cam_fy, cam_cy], [0.0, 0.0, 1.0]],
+                dtype=np.float64,
+            )
+            self.get_logger().info(
+                f'Camera K from params: fx={cam_fx} fy={cam_fy} cx={cam_cx} cy={cam_cy}'
+            )
+        else:
+            self._cam_K = None
+
+        self._cam_frame: str = str(gp('cam_frame')).strip()
+
+        # Static cam→base_link extrinsic (T_base_from_cam).  Same pattern as the cloud
+        # pipeline which uses odometry directly instead of TF.
+        t_bc = np.array([gp('cam_base_tx'), gp('cam_base_ty'), gp('cam_base_tz')], dtype=np.float64)
+        q_bc = np.array([gp('cam_base_qx'), gp('cam_base_qy'), gp('cam_base_qz'), gp('cam_base_qw')], dtype=np.float64)
+        self._T_base_from_cam = _pq_to_se3(t_bc, q_bc)
+        self.get_logger().info(f'T_base_from_cam: t={t_bc.tolist()} q={q_bc.tolist()}')
+
+        self._bridge = None  # cv_bridge skipped: compiled against NumPy 1.x, segfaults with 2.x
+
+        if self._out_dir:
+            img_topic = str(gp('cam_image_topic'))
+            info_topic = str(gp('cam_info_topic'))
+            self.create_subscription(CameraInfo, info_topic, self._camera_info_cb, 1)
+            self.create_subscription(Image, img_topic, self._image_cb, 10)
+            self.get_logger().info(
+                f'Saver subscriptions: image={img_topic}  camera_info={info_topic}'
+            )
+
         H, W = self.emap.grid_shape()
         self.get_logger().info(
             f'Ready | cloud={cloud_topic} odom={odom_topic} '
@@ -491,6 +637,10 @@ class OdinNavGraphNode(Node):
 
     def cloud_callback(self, msg: PointCloud2) -> None:
         self.frame_count += 1
+        if self.max_cloud_frames > 0 and self.frame_count > self.max_cloud_frames:
+            return
+        if self._out_dir is not None and self._rgb_count > self._save_frame_end:
+            return
         if self.process_every_n > 1 and (self.frame_count % self.process_every_n) != 0:
             return
 
@@ -602,6 +752,7 @@ class OdinNavGraphNode(Node):
             compute_layers=True,
         )
         t_graph = (time.perf_counter() - t0) * 1000.0
+        self._last_result = result
 
         n_frontiers = (
             int((result.node_types == 2).sum().item()) if result.num_nodes > 0 else 0
@@ -762,6 +913,193 @@ class OdinNavGraphNode(Node):
             m.points.append(Point(x=float(ps[0]), y=float(ps[1]), z=float(ps[2])))
             m.points.append(Point(x=float(pe[0]), y=float(pe[1]), z=float(pe[2])))
         self.edges_pub.publish(m)
+
+    # ──────────────────────────────────────────────────
+    #  RGB + graph saver
+    # ──────────────────────────────────────────────────
+
+    def _camera_info_cb(self, msg: CameraInfo) -> None:
+        if self._cam_K is not None:
+            return
+        K = np.array(msg.k, dtype=np.float64).reshape(3, 3)
+        if K[0, 0] <= 0.0:
+            return
+        self._cam_K = K
+        if not self._cam_frame:
+            self._cam_frame = msg.header.frame_id
+        self.get_logger().info(
+            f'Camera intrinsics from {msg.header.frame_id}: '
+            f'fx={K[0,0]:.2f} fy={K[1,1]:.2f} cx={K[0,2]:.2f} cy={K[1,2]:.2f}'
+        )
+
+    def _image_cb(self, msg: Image) -> None:
+        if self._out_dir is None:
+            return
+        self._rgb_count += 1
+        if self._rgb_count < self._save_frame_start or self._rgb_count > self._save_frame_end:
+            return
+        if (self._rgb_count - self._save_frame_start) % self._save_every_n != 0:
+            return
+        if not self._cam_frame:
+            self._cam_frame = msg.header.frame_id
+        if self._cam_K is None:
+            self.get_logger().warn(
+                'No camera intrinsics — set cam_fx/fy/cx/cy params or publish camera_info.',
+                throttle_duration_sec=10.0,
+            )
+            return
+        if self._last_result is None or self._last_result.num_nodes == 0:
+            self.get_logger().info('Skipping save: no graph nodes yet.', throttle_duration_sec=5.0)
+            return
+        try:
+            self._save_frame(msg)
+        except Exception as exc:
+            import traceback
+            self.get_logger().error(f'_save_frame failed: {exc}\n{traceback.format_exc()}')
+
+    def _save_frame(self, msg: Image) -> None:
+        """Project global graph nodes onto the RGB image; save rgb/overlay/JSON."""
+        stamp = msg.header.stamp
+        t_sec = stamp.sec + stamp.nanosec * 1e-9
+
+        # ── Decode image to RGB numpy array ───────────────────────
+        try:
+            arr = np.frombuffer(bytes(msg.data), dtype=np.uint8)
+            enc = msg.encoding.lower()
+            ch = 4 if enc in ('bgra8', 'rgba8') else 3
+            arr = arr.reshape(msg.height, msg.width, ch)
+            if enc == 'bgr8':
+                rgb = arr[:, :, ::-1].copy()
+            elif enc == 'bgra8':
+                rgb = arr[:, :, [2, 1, 0]]
+            elif enc == 'rgba8':
+                rgb = arr[:, :, :3]
+            else:
+                rgb = arr  # rgb8 or mono passthrough
+        except Exception as e:
+            self.get_logger().error(f'Image decode failed (encoding={msg.encoding}): {e}')
+            return
+
+        img_h, img_w = rgb.shape[:2]
+        K = self._cam_K
+
+        cam_frame = self._cam_frame or (msg.header.frame_id or 'camera_optical')
+
+        # Odometry + static extrinsic — same pattern as the cloud pipeline.
+        # T_odom_from_cam = T_odom_from_base @ T_base_from_cam (static)
+        odom_msg = self._find_pose_at(t_sec)
+        if odom_msg is None:
+            self.get_logger().warn(
+                f'No odometry near image t={t_sec:.3f} (buf={len(self.odom_buf)}); skipping.',
+                throttle_duration_sec=5.0,
+            )
+            return
+        p_o = odom_msg.pose.pose.position
+        q_o = odom_msg.pose.pose.orientation
+        T_odom_from_base = _pq_to_se3(
+            np.array([p_o.x, p_o.y, p_o.z], dtype=np.float64),
+            np.array([q_o.x, q_o.y, q_o.z, q_o.w], dtype=np.float64),
+        )
+        T_odom_from_cam = T_odom_from_base @ self._T_base_from_cam
+        T_opt_from_odom = np.linalg.inv(T_odom_from_cam)
+
+        # ── Transform graph nodes: odom → optical → custom cam frame ──
+        result = self._last_result
+        pos_odom = result.node_positions.cpu().numpy().astype(np.float64)  # (N, 3)
+        node_types = result.node_types.cpu().numpy()                        # (N,)
+        node_ids = result.node_ids.cpu().numpy()                            # (N,)
+
+        # Optical frame: x-right, y-down, z-forward  (OpenCV convention)
+        R_opt = T_opt_from_odom[:3, :3]
+        t_opt_vec = T_opt_from_odom[:3, 3]
+        pos_opt = (R_opt @ pos_odom.T).T + t_opt_vec  # (N, 3)
+
+        # Camera frame for JSON: x-forward, y-down, z-left
+        #   x_cam = z_opt,  y_cam = y_opt,  z_cam = -x_opt
+        _R_opt_to_cam = np.array([[0, 0, 1], [0, 1, 0], [-1, 0, 0]], dtype=np.float64)
+        pos_cam = (_R_opt_to_cam @ pos_opt.T).T  # (N, 3)
+
+        # ── Pinhole projection (image already undistorted) ────────
+        # Only keep nodes in front of the camera (z_opt > 0)
+        front = pos_opt[:, 2] > 0.1
+        pos_opt_f  = pos_opt[front]
+        pos_cam_f  = pos_cam[front]
+        types_f    = node_types[front]
+        ids_f      = node_ids[front]
+
+        overlay = rgb.copy()
+        visible_nodes: list = []
+
+        if len(pos_opt_f) > 0:
+            z_vals = pos_opt_f[:, 2]
+            u_all  = K[0, 0] * pos_opt_f[:, 0] / z_vals + K[0, 2]
+            v_all  = K[1, 1] * pos_opt_f[:, 1] / z_vals + K[1, 2]
+            inside = (u_all >= 0) & (u_all < img_w) & (v_all >= 0) & (v_all < img_h)
+
+            u_in       = u_all[inside].astype(int)
+            v_in       = v_all[inside].astype(int)
+            pos_cam_in = pos_cam_f[inside]
+            types_in   = types_f[inside]
+            ids_in     = ids_f[inside]
+
+            _C_FRONTIER = (255, 255, 0)   # yellow in RGB
+            _C_FREE     = (0,   0, 255)   # blue   in RGB
+            for xi, yi, ti in zip(u_in, v_in, types_in):
+                col = _C_FRONTIER if int(ti) == 2 else _C_FREE
+                r   = 7           if int(ti) == 2 else 5
+                cv2.circle(overlay, (int(xi), int(yi)), r, col, -1)
+
+            _TYPE_STR = {1: 'free_space', 2: 'frontier'}
+            visible_nodes = [
+                {
+                    'id':           int(nid),
+                    'type':         _TYPE_STR.get(int(ti), 'unknown'),
+                    'position_cam': pos_cam_in[i].tolist(),   # x-fwd, y-down, z-left
+                    'pixel':        [int(u_in[i]), int(v_in[i])],
+                }
+                for i, (nid, ti) in enumerate(zip(ids_in, types_in))
+            ]
+
+        # ── Edges restricted to visible nodes ─────────────────────
+        visible_id_set = {n['id'] for n in visible_nodes}
+        visible_edges: list = []
+        if result.num_edges > 0:
+            edge_arr = result.edge_index.cpu().numpy()   # (E, 2) — node IDs
+            for e in edge_arr:
+                id0, id1 = int(e[0]), int(e[1])
+                if id0 in visible_id_set and id1 in visible_id_set:
+                    visible_edges.append({'node_id_0': id0, 'node_id_1': id1})
+
+        # ── Write files ───────────────────────────────────────────
+        idx = self._rgb_count   # filename reflects actual frame number
+
+        _save_svg_plain(self._out_dir / f'rgb_{idx:06d}.svg', rgb)
+        _save_svg_overlay(self._out_dir / f'nodes_{idx:06d}.svg', rgb, visible_nodes)
+        _save_svg_edges(self._out_dir / f'edges_{idx:06d}.svg', rgb, visible_nodes, visible_edges)
+
+        graph_data = {
+            'frame_index':          idx,
+            'rgb_frame_number':     self._rgb_count,
+            'timestamp':            t_sec,
+            'position_convention':  'camera_frame_x_fwd_y_down_z_left',
+            'camera': {
+                'frame':            cam_frame,
+                'odom_frame':       self.frame_id,
+                'K':                K.tolist(),
+                'width':            img_w,
+                'height':           img_h,
+                'T_opt_from_odom':  T_opt_from_odom.tolist(),
+            },
+            'nodes': visible_nodes,
+            'edges': visible_edges,
+        }
+        with open(self._out_dir / f'graph_{idx:06d}.json', 'w') as fh:
+            json.dump(graph_data, fh, indent=2)
+
+        self.get_logger().info(
+            f'[save frame={idx}] t={t_sec:.3f}s '
+            f'visible={len(visible_nodes)} nodes  {len(visible_edges)} edges'
+        )
 
 
 def main(args=None):
