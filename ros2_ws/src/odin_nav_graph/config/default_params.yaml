@@ -1,0 +1,46 @@
+odin_nav_graph_node:
+  ros__parameters:
+    # Topics
+    cloud_topic: "/odin1/cloud_raw"
+    odom_topic: "/odin1/odometry_highfreq"
+    frame_id: "odom"
+    robot_frame: "odin1_base_link"
+
+    # Rolling elevation map (elevation_mapping_cupy, in odom frame)
+    map_length_xy: 12.0          # meters; map is square (length x length)
+    map_resolution: 0.10         # meters / cell
+    cloud_max_range: 8.0         # drop points further than this from the sensor (meters)
+    sensor_noise_factor: 0.05    # noise = factor * z^2 inside elevation_mapping_cupy
+    em_position_noise: 0.0       # extra translational uncertainty per integrate()
+    em_orientation_noise: 0.0    # extra rotational uncertainty per integrate()
+
+    # Time sync
+    odom_buffer_seconds: 1.0
+    odom_match_max_dt: 0.10      # max stamp delta to accept an odom-cloud pair (seconds)
+
+    # nav_graph builder
+    free_space_sampling_threshold: 0.5
+    safety_distance: 0.05
+    merge_node_distance: 0.4
+    global_merge_distance: 0.4
+    global_max_candidate_edge_distance: 1.2
+
+    # Frontier
+    frontier_kernel_size: 5
+    frontier_odom_threshold: 1.0
+    frontier_max_edge_connectivity: 14
+    minimum_distance_between_frontiers: 0.05
+    minimum_points_in_cluster: 1
+
+    # Elevation -> traversability
+    elev_max_height_diff: 0.20
+    elev_max_slope: 0.5
+    elev_gaussian_sigma: 0.5
+    elev_window_size: 5
+    elev_border_cells: 5
+
+    # Throttling / publishing
+    process_every_n: 1
+    publish_elevation_cloud: true
+    publish_edges: true
+    max_edges_published: 5000

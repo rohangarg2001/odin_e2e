@@ -216,3 +216,19 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ── ROS2 / colcon ───────────────────────────────────────────────
+# ``build/`` is already ignored by the Python template above, but
+# ``install/`` and ``log/`` aren't.
+ros2_ws/install/
+ros2_ws/log/
+
+# ── Third-party clones (re-cloneable, installed via uv pip -e) ──
+# Drop this line and add as a submodule if you want to pin the SHA.
+elevation_mapping_cupy/
+
+# ── OS / IDE leftovers ──────────────────────────────────────────
+.DS_Store
+.idea/
+*.swp
+*.swo
