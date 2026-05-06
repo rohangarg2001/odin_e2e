@@ -236,3 +236,4 @@ elevation_mapping_cupy/
 saved_outputs_odin/
 install/
 log/
+.vscode/

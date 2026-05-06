@@ -40,10 +40,10 @@ import torch
 from rclpy.node import Node
 
 from sensor_msgs.msg import PointCloud2, PointField, Image, CameraInfo
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, OccupancyGrid, MapMetaData
 from std_msgs.msg import Header
 from visualization_msgs.msg import Marker
-from geometry_msgs.msg import Point
+from geometry_msgs.msg import Point, Pose, Quaternion
 import base64
 import cv2
 import json
@@ -74,6 +74,32 @@ def _ensure_nav_graph_on_path() -> None:
 
 _ensure_nav_graph_on_path()
 
+
+def _ensure_explorfm_on_path() -> None:
+    """Make ``explorfm`` and its ``nvidia_radio`` sibling importable.
+
+    Both live inside the ``nebula2-wildos`` submodule at repo root.  We add
+    the submodule root (so ``explorfm`` and ``nvidia_radio`` resolve as
+    top-level packages, matching how ExploRFMInference imports them).
+    """
+    try:
+        import explorfm  # noqa: F401
+        import nvidia_radio  # noqa: F401
+        return
+    except ImportError:
+        pass
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.environ.get('NEBULA2_WILDOS_PATH', ''),
+        os.path.abspath(os.path.join(here, '..', '..', '..', '..', 'nebula2-wildos')),
+        os.path.abspath(os.path.join(here, '..', '..', '..', '..', '..', '..', 'nebula2-wildos')),
+    ]
+    for path in candidates:
+        if path and os.path.isdir(os.path.join(path, 'explorfm')):
+            sys.path.insert(0, path)
+            return
+
+
 from nav_graph import (  # noqa: E402
     NavigationGraphBuilder,
     NavGraphConfig,
@@ -81,6 +107,7 @@ from nav_graph import (  # noqa: E402
     ExplorationConfig,
     ElevationMapConfig,
 )
+from nav_graph.core.graph_layer import ExternalLayer, MergePolicy  # noqa: E402
 
 from odin_nav_graph.elevation_map import ElevationMapWrapper  # noqa: E402
 
@@ -299,14 +326,98 @@ def _patched_assign_z_inbounds(
     gg._global_pos[idx_t, 2] = z_t
 
 
+def _make_traversability_smoother(builder, median_size: int):
+    """Wrap ``_compute_traversability`` with a post-pass median-filter smoother.
+
+    Encoding before filtering:  free=1.0, unknown=NaN→0.5, occupied=0.0.
+    After ``scipy.ndimage.median_filter`` on this float map, re-threshold:
+      >=0.75 → free, <=0.25 → occupied, else → NaN.
+
+    A cell needs a majority of same-type neighbours to keep its class.
+    Isolated speckles of any type (free island, occupied dot, unknown gap)
+    get replaced by the value of the cells around them — exactly a
+    majority-vote / smoothing operation on the categorical map.
+
+    ``median_size`` must be odd and >= 3; 0 or 1 disables.
+    """
+    if median_size < 3 or median_size % 2 == 0:
+        return  # nothing to install
+
+    orig_fn = builder._compute_traversability  # static method → callable
+
+    def _patched(elevation: np.ndarray, config):
+        from scipy.ndimage import median_filter as _mf
+        trav = orig_fn(elevation, config)
+
+        # NaN (unknown) → 0.5 so it participates in the median vote.
+        filled = np.where(np.isnan(trav), 0.5, trav).astype(np.float32)
+        smoothed = _mf(filled, size=median_size, mode='nearest')
+
+        result = np.full_like(trav, np.nan, dtype=np.float32)
+        result[smoothed >= 0.75] = 1.0   # majority free
+        result[smoothed <= 0.25] = 0.0   # majority occupied
+        # 0.25 < smoothed < 0.75 stays NaN (genuinely mixed neighbourhood)
+        return result
+
+    builder._compute_traversability = _patched
+
+
+def _make_ext_map_fixup(gg, original_fn):
+    """Wrap ``_update_extended_map`` so that confirmed observations always win.
+
+    The default merge rule makes occupied cells sticky: once a cell is written
+    as 0 (occupied) it can never be cleared to free (255).  In simulation this
+    is fine — walls are walls.  In real-world data, traversability
+    misclassification from sensor noise permanently blocks the extended map so
+    no edges can be collision-checked through it.
+
+    This wrapper calls the original function (which handles rolling, padding,
+    and first-observation logic) and then does a second pass over the local
+    footprint with the rule:
+
+        any confirmed (non-unknown) observation → overwrite
+
+    That means a free observation from the current scan can clear a cell that
+    was previously marked occupied by a noisy scan.  Cells outside the local
+    footprint are unaffected — their history is preserved.
+
+    Only applies when ``occ_grid_int8`` is provided (3-state path), because
+    the binary path cannot distinguish unknown from occupied.
+    """
+    def _patched(new_local_grid, center_x, center_y, resolution, occ_grid_int8=None):
+        original_fn(new_local_grid, center_x, center_y, resolution, occ_grid_int8=occ_grid_int8)
+
+        if gg._ext_map is None or occ_grid_int8 is None:
+            return
+
+        H, W = new_local_grid.shape
+        ext_H, ext_W = gg._ext_shape
+        row_off = (ext_H - H) // 2
+        col_off = (ext_W - W) // 2
+        device = gg._ext_map.device
+
+        # Reconstruct local_ext exactly as _update_extended_map does (occ_grid_int8
+        # has already been rot90'd twice by add_local_graph_gpu before being passed here).
+        int8_t = torch.from_numpy(np.ascontiguousarray(occ_grid_int8)).to(device)
+        local_ext = torch.full((H, W), 128, dtype=torch.uint8, device=device)
+        local_ext[int8_t == 0]   = 255   # free
+        local_ext[int8_t == 100] = 0     # occupied
+
+        # Any confirmed observation overwrites — overrides the sticky-occupied rule.
+        ext_slice = gg._ext_map[row_off:row_off + H, col_off:col_off + W]
+        confirmed = local_ext != 128
+        ext_slice[confirmed] = local_ext[confirmed]
+
+    return _patched
+
+
 def _install_builder_patches(builder) -> None:
-    """Install both patches on a ``NavigationGraphBuilder`` instance."""
-    builder.global_builder.tensor_merge_local_nodes_gpu = types.MethodType(
-        _patched_merge_2d, builder.global_builder
-    )
-    builder._assign_z_from_elevation = types.MethodType(
-        _patched_assign_z_inbounds, builder
-    )
+    """Install all patches on a ``NavigationGraphBuilder`` instance."""
+    gg = builder.global_builder
+    gg.tensor_merge_local_nodes_gpu = types.MethodType(_patched_merge_2d, gg)
+    builder._assign_z_from_elevation = types.MethodType(_patched_assign_z_inbounds, builder)
+    # Wrap _update_extended_map so confirmed observations can clear stuck-occupied cells.
+    gg._update_extended_map = _make_ext_map_fixup(gg, gg._update_extended_map)
 
 
 def _pq_to_se3(translation: np.ndarray, quaternion_xyzw: np.ndarray) -> np.ndarray:
@@ -419,10 +530,19 @@ class OdinNavGraphNode(Node):
         self.declare_parameter('elev_gaussian_sigma', 0.5)
         self.declare_parameter('elev_window_size', 5)
         self.declare_parameter('elev_border_cells', 0)
+        # Traversability smoothing: median filter on the float map after height/slope
+        # computation but before node generation.  NaN (unknown) is treated as 0.5
+        # (midpoint between free=1.0 and occupied=0.0) so it participates in the vote.
+        # Re-threshold: >=0.75 → free, <=0.25 → occupied, else → NaN (unknown).
+        # This means a cell needs a majority of same-type neighbours to keep its class;
+        # isolated speckles of any type get replaced by their surroundings.
+        # Must be an odd integer >= 3.  0 or 1 disables.  At 0.10 m/cell, size=3
+        # removes single-cell speckles (10 cm); size=5 removes up to 20 cm features.
+        self.declare_parameter('trav_median_filter_size', 5)
 
         # Throttling / publishing
         self.declare_parameter('process_every_n', 1)
-        self.declare_parameter('max_cloud_frames', 385)   # 0 = unlimited; stop graph updates after N frames
+        self.declare_parameter('max_cloud_frames', 6000)   # 0 = unlimited; stop graph updates after N frames
         self.declare_parameter('publish_elevation_cloud', True)
         self.declare_parameter('publish_edges', True)
         self.declare_parameter('max_edges_published', 100000)
@@ -445,8 +565,8 @@ class OdinNavGraphNode(Node):
         # RGB + graph saver
         self.declare_parameter('out_directory', '')
         self.declare_parameter('save_every_n_frames', 5)
-        self.declare_parameter('save_frame_start', 100)   # first _rgb_count to save (80*20)
-        self.declare_parameter('save_frame_end',   385)   # last  _rgb_count to save (120*20)
+        self.declare_parameter('save_frame_start', 5000)   # first _rgb_count to save (80*20)
+        self.declare_parameter('save_frame_end',   6000)   # last  _rgb_count to save (120*20)
         self.declare_parameter('cam_image_topic', '/odin1/image/undistorted')
         self.declare_parameter('cam_info_topic', '/odin1/camera_info')
         self.declare_parameter('cam_frame', 'camera_optical')  # label for JSON only
@@ -462,6 +582,21 @@ class OdinNavGraphNode(Node):
         self.declare_parameter('cam_base_qy',  0.5048)
         self.declare_parameter('cam_base_qz', -0.4996)
         self.declare_parameter('cam_base_qw',  0.5005)
+
+        # ExploRFM (per-image traversability + frontier-score model) → node layers
+        self.declare_parameter('enable_explorfm_layers', False)
+        self.declare_parameter('explorfm_every_n_images', 1)
+        self.declare_parameter('explorfm_frontier_ckpt', '')
+        self.declare_parameter('explorfm_trav_ckpt', '')
+        self.declare_parameter('explorfm_radio_version', 'c-radio_v3-b')
+        self.declare_parameter('explorfm_adaptor_version', '')
+        self.declare_parameter('explorfm_adaptor_ckpt_path', '')
+        self.declare_parameter('explorfm_use_naclip', True)
+        self.declare_parameter('explorfm_radio_dim', 768)
+        self.declare_parameter('explorfm_static_scale_factor', 0.5)
+        self.declare_parameter('explorfm_precision', 'FP16')
+        self.declare_parameter('explorfm_trav_layer', 'traversability')
+        self.declare_parameter('explorfm_frontier_layer', 'frontier_score')
 
         gp = lambda n: self.get_parameter(n).value  # noqa: E731
         cloud_topic = gp('cloud_topic')
@@ -523,8 +658,12 @@ class OdinNavGraphNode(Node):
             self._z_lookup_min_filter_radius_cells
         )
         _install_builder_patches(self.builder)
+        trav_median_size = int(gp('trav_median_filter_size'))
+        _make_traversability_smoother(self.builder, trav_median_size)
         self.get_logger().info(
-            'NavigationGraphBuilder ready (2D-merge + in-bounds Z patches installed).'
+            f'NavigationGraphBuilder ready '
+            f'(2D-merge + in-bounds Z + ext-map fixup + '
+            f'trav-smoother size={trav_median_size} patches installed).'
         )
 
         # ── Rolling elevation map (elevation_mapping_cupy) ────────────
@@ -555,6 +694,11 @@ class OdinNavGraphNode(Node):
         self.graph_pub = self.create_publisher(PointCloud2, '~/graph_nodes', 1)
         self.frontier_pub = self.create_publisher(PointCloud2, '~/frontier_cloud', 1)
         self.edges_pub = self.create_publisher(Marker, '~/graph_edges', 1)
+        # ExploRFM score clouds — intensity in [0,1], visualise with RViz intensity colormap.
+        self.trav_score_pub = self.create_publisher(PointCloud2, '~/trav_score_cloud', 1)
+        self.frontier_score_pub = self.create_publisher(PointCloud2, '~/frontier_score_cloud', 1)
+        # Extended global occupancy grid used for edge collision checking inside GlobalGraphGenerator.
+        self.global_occ_pub = self.create_publisher(OccupancyGrid, '~/global_occ_grid', 1)
 
         # ── RGB + graph saver ─────────────────────────────────────────
         self._save_every_n = int(gp('save_every_n_frames'))
@@ -595,13 +739,24 @@ class OdinNavGraphNode(Node):
 
         self._bridge = None  # cv_bridge skipped: compiled against NumPy 1.x, segfaults with 2.x
 
-        if self._out_dir:
+        # ── ExploRFM model + per-node layers ──────────────────────────
+        self._explorfm = None
+        self._explorfm_every_n = max(1, int(gp('explorfm_every_n_images')))
+        self._trav_layer_name = str(gp('explorfm_trav_layer'))
+        self._front_layer_name = str(gp('explorfm_frontier_layer'))
+        if bool(gp('enable_explorfm_layers')):
+            self._init_explorfm(gp)
+
+        # Subscribe to image+info if EITHER the saver OR the model is enabled.
+        if self._out_dir or self._explorfm is not None:
             img_topic = str(gp('cam_image_topic'))
             info_topic = str(gp('cam_info_topic'))
             self.create_subscription(CameraInfo, info_topic, self._camera_info_cb, 1)
             self.create_subscription(Image, img_topic, self._image_cb, 10)
             self.get_logger().info(
-                f'Saver subscriptions: image={img_topic}  camera_info={info_topic}'
+                f'Image subscriptions: image={img_topic}  camera_info={info_topic} '
+                f'(saver={"on" if self._out_dir else "off"}, '
+                f'explorfm={"on" if self._explorfm is not None else "off"})'
             )
 
         H, W = self.emap.grid_shape()
@@ -780,6 +935,10 @@ class OdinNavGraphNode(Node):
                 self._z_lookup_min_filter_radius_cells
             )
             _install_builder_patches(self.builder)
+            _make_traversability_smoother(
+                self.builder,
+                int(self.get_parameter('trav_median_filter_size').value),
+            )
             return
 
         stamp = msg.header.stamp
@@ -789,6 +948,8 @@ class OdinNavGraphNode(Node):
         self._publish_frontier_cloud(result, stamp)
         if self.publish_edges_flag:
             self._publish_edges(result, stamp)
+        self._publish_score_clouds(result, stamp)
+        self._publish_global_occ_grid(stamp)
 
     # ──────────────────────────────────────────────────
     #  Publishing helpers
@@ -914,9 +1075,166 @@ class OdinNavGraphNode(Node):
             m.points.append(Point(x=float(pe[0]), y=float(pe[1]), z=float(pe[2])))
         self.edges_pub.publish(m)
 
+    def _publish_score_clouds(self, result, stamp) -> None:
+        """Publish ExploRFM layer scores as separate intensity clouds.
+
+        ~/trav_score_cloud  — all nodes, intensity = traversability in [0, 1].
+        ~/frontier_score_cloud — frontier nodes only, intensity = frontier score.
+        Nodes that have never been ingested stay at 0.0 (ExternalLayer default).
+        """
+        if result.num_nodes == 0 or result.node_scores is None:
+            return
+        names = result.score_layer_names
+        if not names:
+            return
+
+        positions = result.node_positions.cpu().numpy().astype(np.float32, copy=True)
+        positions[:, 2] += self.viz_z_offset
+
+        # ── traversability — all nodes ───────────────────────────────
+        if self._trav_layer_name in names:
+            col = names.index(self._trav_layer_name)
+            scores = result.node_scores[:, col].cpu().float().numpy()
+            self.trav_score_pub.publish(
+                self._make_xyz_intensity_cloud(positions, scores, stamp)
+            )
+
+        # ── frontier score — frontier nodes only ─────────────────────
+        if self._front_layer_name in names:
+            front_mask = result.node_types == 2
+            if bool(front_mask.any().item()):
+                col = names.index(self._front_layer_name)
+                scores = result.node_scores[front_mask, col].cpu().float().numpy()
+                self.frontier_score_pub.publish(
+                    self._make_xyz_intensity_cloud(
+                        positions[front_mask.cpu().numpy()], scores, stamp,
+                    )
+                )
+
+    def _publish_global_occ_grid(self, stamp) -> None:
+        """Publish the extended sliding-window occupancy grid from GlobalGraphGenerator.
+
+        This is the exact grid used for edge collision checking.  It is larger
+        than the local elevation map (ext_scale_factor × local size) and
+        accumulates observations across frames as the robot moves.
+
+        Values follow the ROS convention: 0=free, 100=occupied, -1=unknown.
+        Frame: same as all other published topics (odom).
+
+        Internal _ext_map convention:
+            col 0 = east, col W-1 = west,  row 0 = south, row H-1 = north.
+        After flipping columns the origin sits at the south-west corner, which
+        is the standard nav_msgs/OccupancyGrid layout.
+        """
+        gg = self.builder.global_builder
+        if gg._ext_map is None:
+            return
+
+        ext_H, ext_W = gg._ext_shape
+        cx, cy = gg._ext_center
+        res = gg._ext_resolution
+
+        # Move to CPU once; avoid multiple round-trips.
+        ext_np = gg._ext_map.cpu().numpy()  # uint8: 0=blocked, 128=unobserved, 255=free
+
+        # Convert to ROS int8: 0=free, 100=occupied, -1=unknown.
+        ros_data = np.full((ext_H, ext_W), -1, dtype=np.int8)
+        ros_data[ext_np == 255] = 0
+        ros_data[ext_np == 0] = 100
+        # 128 (unobserved) stays -1.
+
+        # Flip columns: internal col 0 = east → ROS col 0 = west (standard).
+        # Row order is unchanged: row 0 = south in both conventions.
+        ros_data = np.ascontiguousarray(ros_data[:, ::-1])
+
+        msg = OccupancyGrid()
+        msg.header = Header(stamp=stamp, frame_id=self.frame_id)
+        msg.info = MapMetaData()
+        msg.info.resolution = float(res)
+        msg.info.width = int(ext_W)
+        msg.info.height = int(ext_H)
+        msg.info.origin = Pose()
+        # South-west corner (bottom-left) after column flip.
+        msg.info.origin.position.x = float(cx - ext_W * res / 2.0)
+        msg.info.origin.position.y = float(cy - ext_H * res / 2.0)
+        msg.info.origin.position.z = 0.0
+        msg.info.origin.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
+        msg.data = ros_data.flatten().tolist()
+        self.global_occ_pub.publish(msg)
+
     # ──────────────────────────────────────────────────
     #  RGB + graph saver
     # ──────────────────────────────────────────────────
+
+    def _init_explorfm(self, gp) -> None:
+        """Build the ExploRFM model and register its two output layers.
+
+        Layers are :class:`ExternalLayer` (no compute logic) using the default
+        REPLACE policy — each new image overwrites prior values for any nodes
+        it observes.  Untouched nodes keep their last ingested score.
+        """
+        _ensure_explorfm_on_path()
+        try:
+            from explorfm import ExploRFMInference  # noqa: WPS433  (runtime import)
+        except Exception as exc:  # pragma: no cover  - missing submodule
+            self.get_logger().error(
+                f'enable_explorfm_layers=True but explorfm import failed: {exc}; '
+                'check that nebula2-wildos is on disk and dependencies installed.'
+            )
+            return
+
+        frontier_ckpt = str(gp('explorfm_frontier_ckpt')).strip()
+        trav_ckpt = str(gp('explorfm_trav_ckpt')).strip()
+        if not frontier_ckpt or not trav_ckpt:
+            self.get_logger().error(
+                'explorfm_frontier_ckpt and explorfm_trav_ckpt must both be set.'
+            )
+            return
+
+        adaptor_version = str(gp('explorfm_adaptor_version')).strip() or None
+        adaptor_ckpt_path = str(gp('explorfm_adaptor_ckpt_path')).strip() or None
+
+        self.get_logger().info(
+            f'Loading ExploRFM (radio={gp("explorfm_radio_version")}, '
+            f'precision={gp("explorfm_precision")}, '
+            f'scale={gp("explorfm_static_scale_factor")}, '
+            f'adaptor={adaptor_version})...'
+        )
+        try:
+            self._explorfm = ExploRFMInference(
+                frontier_ckpt=frontier_ckpt,
+                traversability_ckpt=trav_ckpt,
+                model_version=str(gp('explorfm_radio_version')),
+                adaptor_version=adaptor_version,
+                adaptor_ckpt_path=adaptor_ckpt_path,
+                use_naclip=bool(gp('explorfm_use_naclip')),
+                radio_dim=int(gp('explorfm_radio_dim')),
+                static_scale_factor=float(gp('explorfm_static_scale_factor')),
+                model_precision=str(gp('explorfm_precision')),
+            )
+        except Exception as exc:  # pragma: no cover
+            import traceback
+            self.get_logger().error(
+                f'ExploRFM init failed: {exc}\n{traceback.format_exc()}'
+            )
+            self._explorfm = None
+            return
+
+        # Register two persistent layers (REPLACE on each ingest) so every
+        # cloud-frame compute_layers() pass sees the most recent observation.
+        self.builder.add_layer(
+            ExternalLayer(self._trav_layer_name, ingest_policy=MergePolicy.REPLACE),
+            weight=0.0,
+        )
+        self.builder.add_layer(
+            ExternalLayer(self._front_layer_name, ingest_policy=MergePolicy.REPLACE),
+            weight=0.0,
+        )
+        self.get_logger().info(
+            f'ExploRFM ready. Layers registered: '
+            f'{self._trav_layer_name!r}, {self._front_layer_name!r} '
+            f'(weight=0.0 — ingest-only; raise via set_layer_weight to feed combined score).'
+        )
 
     def _camera_info_cb(self, msg: CameraInfo) -> None:
         if self._cam_K is not None:
@@ -933,13 +1251,20 @@ class OdinNavGraphNode(Node):
         )
 
     def _image_cb(self, msg: Image) -> None:
-        if self._out_dir is None:
-            return
         self._rgb_count += 1
-        if self._rgb_count < self._save_frame_start or self._rgb_count > self._save_frame_end:
+
+        do_infer = (
+            self._explorfm is not None
+            and (self._rgb_count % self._explorfm_every_n == 0)
+        )
+        in_save_window = (
+            self._out_dir is not None
+            and self._save_frame_start <= self._rgb_count <= self._save_frame_end
+            and (self._rgb_count - self._save_frame_start) % self._save_every_n == 0
+        )
+        if not (do_infer or in_save_window):
             return
-        if (self._rgb_count - self._save_frame_start) % self._save_every_n != 0:
-            return
+
         if not self._cam_frame:
             self._cam_frame = msg.header.frame_id
         if self._cam_K is None:
@@ -949,51 +1274,83 @@ class OdinNavGraphNode(Node):
             )
             return
         if self._last_result is None or self._last_result.num_nodes == 0:
-            self.get_logger().info('Skipping save: no graph nodes yet.', throttle_duration_sec=5.0)
+            self.get_logger().info(
+                'Skipping image: no graph nodes yet.', throttle_duration_sec=5.0,
+            )
             return
-        try:
-            self._save_frame(msg)
-        except Exception as exc:
-            import traceback
-            self.get_logger().error(f'_save_frame failed: {exc}\n{traceback.format_exc()}')
 
-    def _save_frame(self, msg: Image) -> None:
-        """Project global graph nodes onto the RGB image; save rgb/overlay/JSON."""
-        stamp = msg.header.stamp
-        t_sec = stamp.sec + stamp.nanosec * 1e-9
+        rgb = self._decode_image(msg)
+        if rgb is None:
+            return
 
-        # ── Decode image to RGB numpy array ───────────────────────
+        t_sec = stamp_to_sec(msg.header.stamp)
+        proj = self._project_visible_nodes(rgb.shape[:2], t_sec)
+        if proj is None:
+            return
+
+        # Per-node values produced by the model (same length/order as proj['visible_nodes']).
+        trav_per_node: Optional[np.ndarray] = None
+        front_per_node: Optional[np.ndarray] = None
+        if do_infer:
+            try:
+                trav_per_node, front_per_node = self._infer_and_ingest(rgb, proj)
+            except Exception as exc:  # pragma: no cover  - defensive
+                import traceback
+                self.get_logger().error(
+                    f'ExploRFM inference failed: {exc}\n{traceback.format_exc()}',
+                    throttle_duration_sec=10.0,
+                )
+
+        if in_save_window:
+            try:
+                self._save_frame_files(
+                    msg, rgb, proj, t_sec, trav_per_node, front_per_node,
+                )
+            except Exception as exc:
+                import traceback
+                self.get_logger().error(
+                    f'_save_frame_files failed: {exc}\n{traceback.format_exc()}'
+                )
+
+    def _decode_image(self, msg: Image) -> Optional[np.ndarray]:
+        """ROS Image → HxWx3 uint8 RGB. Returns None on decode failure."""
         try:
             arr = np.frombuffer(bytes(msg.data), dtype=np.uint8)
             enc = msg.encoding.lower()
             ch = 4 if enc in ('bgra8', 'rgba8') else 3
             arr = arr.reshape(msg.height, msg.width, ch)
             if enc == 'bgr8':
-                rgb = arr[:, :, ::-1].copy()
-            elif enc == 'bgra8':
-                rgb = arr[:, :, [2, 1, 0]]
-            elif enc == 'rgba8':
-                rgb = arr[:, :, :3]
-            else:
-                rgb = arr  # rgb8 or mono passthrough
-        except Exception as e:
-            self.get_logger().error(f'Image decode failed (encoding={msg.encoding}): {e}')
-            return
+                return arr[:, :, ::-1].copy()
+            if enc == 'bgra8':
+                return arr[:, :, [2, 1, 0]].copy()
+            if enc == 'rgba8':
+                return arr[:, :, :3].copy()
+            return arr.copy()  # rgb8 / mono passthrough
+        except Exception as exc:
+            self.get_logger().error(
+                f'Image decode failed (encoding={msg.encoding}): {exc}'
+            )
+            return None
 
-        img_h, img_w = rgb.shape[:2]
-        K = self._cam_K
+    def _project_visible_nodes(
+        self,
+        img_shape_hw: Tuple[int, int],
+        t_sec: float,
+    ) -> Optional[dict]:
+        """Project ``_last_result`` global nodes into the camera image.
 
-        cam_frame = self._cam_frame or (msg.header.frame_id or 'camera_optical')
-
-        # Odometry + static extrinsic — same pattern as the cloud pipeline.
-        # T_odom_from_cam = T_odom_from_base @ T_base_from_cam (static)
+        Returns a dict bundling everything downstream consumers need:
+        the per-node arrays for inference + ingest, and the list-of-dicts
+        form for SVG/JSON.  Returns None if no matching odometry exists.
+        """
         odom_msg = self._find_pose_at(t_sec)
         if odom_msg is None:
             self.get_logger().warn(
                 f'No odometry near image t={t_sec:.3f} (buf={len(self.odom_buf)}); skipping.',
                 throttle_duration_sec=5.0,
             )
-            return
+            return None
+
         p_o = odom_msg.pose.pose.position
         q_o = odom_msg.pose.pose.orientation
         T_odom_from_base = _pq_to_se3(
@@ -1003,102 +1360,182 @@ class OdinNavGraphNode(Node):
         T_odom_from_cam = T_odom_from_base @ self._T_base_from_cam
         T_opt_from_odom = np.linalg.inv(T_odom_from_cam)
 
-        # ── Transform graph nodes: odom → optical → custom cam frame ──
         result = self._last_result
         pos_odom = result.node_positions.cpu().numpy().astype(np.float64)  # (N, 3)
-        node_types = result.node_types.cpu().numpy()                        # (N,)
-        node_ids = result.node_ids.cpu().numpy()                            # (N,)
+        node_types = result.node_types.cpu().numpy()
+        node_ids = result.node_ids.cpu().numpy()
 
-        # Optical frame: x-right, y-down, z-forward  (OpenCV convention)
+        # Optical frame: x-right, y-down, z-forward (OpenCV convention).
         R_opt = T_opt_from_odom[:3, :3]
         t_opt_vec = T_opt_from_odom[:3, 3]
-        pos_opt = (R_opt @ pos_odom.T).T + t_opt_vec  # (N, 3)
-
-        # Camera frame for JSON: x-forward, y-down, z-left
-        #   x_cam = z_opt,  y_cam = y_opt,  z_cam = -x_opt
+        pos_opt = (R_opt @ pos_odom.T).T + t_opt_vec
+        # JSON-friendly cam frame: x-fwd, y-down, z-left.
         _R_opt_to_cam = np.array([[0, 0, 1], [0, 1, 0], [-1, 0, 0]], dtype=np.float64)
-        pos_cam = (_R_opt_to_cam @ pos_opt.T).T  # (N, 3)
+        pos_cam = (_R_opt_to_cam @ pos_opt.T).T
 
-        # ── Pinhole projection (image already undistorted) ────────
-        # Only keep nodes in front of the camera (z_opt > 0)
         front = pos_opt[:, 2] > 0.1
-        pos_opt_f  = pos_opt[front]
-        pos_cam_f  = pos_cam[front]
-        types_f    = node_types[front]
-        ids_f      = node_ids[front]
+        pos_opt_f = pos_opt[front]
+        pos_cam_f = pos_cam[front]
+        types_f = node_types[front]
+        ids_f = node_ids[front]
 
-        overlay = rgb.copy()
-        visible_nodes: list = []
+        img_h, img_w = img_shape_hw
+        K = self._cam_K
+        u_in = np.empty(0, dtype=np.int64)
+        v_in = np.empty(0, dtype=np.int64)
+        pos_cam_in = np.empty((0, 3), dtype=np.float64)
+        types_in = np.empty(0, dtype=node_types.dtype)
+        ids_in = np.empty(0, dtype=node_ids.dtype)
 
         if len(pos_opt_f) > 0:
             z_vals = pos_opt_f[:, 2]
-            u_all  = K[0, 0] * pos_opt_f[:, 0] / z_vals + K[0, 2]
-            v_all  = K[1, 1] * pos_opt_f[:, 1] / z_vals + K[1, 2]
+            u_all = K[0, 0] * pos_opt_f[:, 0] / z_vals + K[0, 2]
+            v_all = K[1, 1] * pos_opt_f[:, 1] / z_vals + K[1, 2]
             inside = (u_all >= 0) & (u_all < img_w) & (v_all >= 0) & (v_all < img_h)
-
-            u_in       = u_all[inside].astype(int)
-            v_in       = v_all[inside].astype(int)
+            u_in = u_all[inside].astype(np.int64)
+            v_in = v_all[inside].astype(np.int64)
             pos_cam_in = pos_cam_f[inside]
-            types_in   = types_f[inside]
-            ids_in     = ids_f[inside]
+            types_in = types_f[inside]
+            ids_in = ids_f[inside]
 
-            _C_FRONTIER = (255, 255, 0)   # yellow in RGB
-            _C_FREE     = (0,   0, 255)   # blue   in RGB
-            for xi, yi, ti in zip(u_in, v_in, types_in):
-                col = _C_FRONTIER if int(ti) == 2 else _C_FREE
-                r   = 7           if int(ti) == 2 else 5
-                cv2.circle(overlay, (int(xi), int(yi)), r, col, -1)
+        _TYPE_STR = {1: 'free_space', 2: 'frontier'}
+        visible_nodes = [
+            {
+                'id':           int(ids_in[i]),
+                'type':         _TYPE_STR.get(int(types_in[i]), 'unknown'),
+                'position_cam': pos_cam_in[i].tolist(),
+                'pixel':        [int(u_in[i]), int(v_in[i])],
+            }
+            for i in range(len(ids_in))
+        ]
 
-            _TYPE_STR = {1: 'free_space', 2: 'frontier'}
-            visible_nodes = [
-                {
-                    'id':           int(nid),
-                    'type':         _TYPE_STR.get(int(ti), 'unknown'),
-                    'position_cam': pos_cam_in[i].tolist(),   # x-fwd, y-down, z-left
-                    'pixel':        [int(u_in[i]), int(v_in[i])],
-                }
-                for i, (nid, ti) in enumerate(zip(ids_in, types_in))
-            ]
-
-        # ── Edges restricted to visible nodes ─────────────────────
         visible_id_set = {n['id'] for n in visible_nodes}
         visible_edges: list = []
         if result.num_edges > 0:
-            edge_arr = result.edge_index.cpu().numpy()   # (E, 2) — node IDs
+            edge_arr = result.edge_index.cpu().numpy()
             for e in edge_arr:
                 id0, id1 = int(e[0]), int(e[1])
                 if id0 in visible_id_set and id1 in visible_id_set:
                     visible_edges.append({'node_id_0': id0, 'node_id_1': id1})
 
-        # ── Write files ───────────────────────────────────────────
-        idx = self._rgb_count   # filename reflects actual frame number
+        return {
+            'visible_nodes': visible_nodes,
+            'visible_edges': visible_edges,
+            'visible_ids':   ids_in.astype(np.int64),
+            'visible_types': types_in.astype(np.int64),
+            'visible_u':     u_in,
+            'visible_v':     v_in,
+            'T_opt_from_odom': T_opt_from_odom,
+        }
+
+    def _infer_and_ingest(
+        self,
+        rgb: np.ndarray,
+        proj: dict,
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """Run ExploRFM, sample at projected pixels, ingest into layers.
+
+        Returns ``(trav_per_node, front_per_node)`` aligned with
+        ``proj['visible_nodes']``.  ``front_per_node`` is NaN for non-frontier
+        rows (they are not ingested into the frontier layer).
+        """
+        ids_np = proj['visible_ids']
+        if ids_np.size == 0:
+            return None, None
+
+        t0 = time.perf_counter()
+        trav_t, front_t, _ = self._explorfm.forward_on_numpy(rgb)
+        # Both tensors are (1, 1, H, W) on cuda, sized to the input rgb.
+        trav_np = trav_t[0, 0].detach().float().cpu().numpy()
+        front_np = front_t[0, 0].detach().float().cpu().numpy()
+        infer_ms = (time.perf_counter() - t0) * 1000.0
+
+        h, w = trav_np.shape
+        u = np.clip(proj['visible_u'], 0, w - 1)
+        v = np.clip(proj['visible_v'], 0, h - 1)
+        trav_vals = trav_np[v, u].astype(np.float32)
+
+        types_np = proj['visible_types']
+        front_mask = types_np == 2
+        front_vals_full = np.full(ids_np.shape, np.nan, dtype=np.float32)
+        if front_mask.any():
+            front_vals_full[front_mask] = front_np[v[front_mask], u[front_mask]].astype(np.float32)
+
+        device = self.builder.global_builder._global_pos.device
+        ids_t = torch.from_numpy(ids_np).to(device=device, dtype=torch.long)
+        trav_vals_t = torch.from_numpy(trav_vals).to(device=device, dtype=torch.float32)
+        self.builder.ingest_layer_scores(self._trav_layer_name, ids_t, trav_vals_t)
+
+        n_front = int(front_mask.sum())
+        if n_front > 0:
+            front_ids_t = torch.from_numpy(ids_np[front_mask]).to(device=device, dtype=torch.long)
+            front_vals_t = torch.from_numpy(front_vals_full[front_mask]).to(
+                device=device, dtype=torch.float32,
+            )
+            self.builder.ingest_layer_scores(self._front_layer_name, front_ids_t, front_vals_t)
+
+        self.get_logger().info(
+            f'[explorfm rgb={self._rgb_count}] infer={infer_ms:.1f}ms '
+            f'visible={ids_np.size} frontiers={n_front} '
+            f'trav[min={trav_np.min():.2f} max={trav_np.max():.2f}] '
+            f'front[min={front_np.min():.2f} max={front_np.max():.2f}]'
+        )
+        return trav_vals, front_vals_full
+
+    def _save_frame_files(
+        self,
+        msg: Image,
+        rgb: np.ndarray,
+        proj: dict,
+        t_sec: float,
+        trav_per_node: Optional[np.ndarray],
+        front_per_node: Optional[np.ndarray],
+    ) -> None:
+        """Write the four-file frame: rgb / nodes / edges / json."""
+        idx = self._rgb_count
+        img_h, img_w = rgb.shape[:2]
+        K = self._cam_K
+        cam_frame = self._cam_frame or (msg.header.frame_id or 'camera_optical')
+
+        # Augment visible_nodes with model values for verification in the JSON.
+        visible_nodes = proj['visible_nodes']
+        if trav_per_node is not None:
+            for i, node in enumerate(visible_nodes):
+                node['traversability'] = float(trav_per_node[i])
+        if front_per_node is not None:
+            for i, node in enumerate(visible_nodes):
+                val = front_per_node[i]
+                if np.isfinite(val):
+                    node['frontier_score'] = float(val)
 
         _save_svg_plain(self._out_dir / f'rgb_{idx:06d}.svg', rgb)
         _save_svg_overlay(self._out_dir / f'nodes_{idx:06d}.svg', rgb, visible_nodes)
-        _save_svg_edges(self._out_dir / f'edges_{idx:06d}.svg', rgb, visible_nodes, visible_edges)
+        _save_svg_edges(
+            self._out_dir / f'edges_{idx:06d}.svg', rgb, visible_nodes, proj['visible_edges'],
+        )
 
         graph_data = {
-            'frame_index':          idx,
-            'rgb_frame_number':     self._rgb_count,
-            'timestamp':            t_sec,
-            'position_convention':  'camera_frame_x_fwd_y_down_z_left',
+            'frame_index':         idx,
+            'rgb_frame_number':    self._rgb_count,
+            'timestamp':           t_sec,
+            'position_convention': 'camera_frame_x_fwd_y_down_z_left',
             'camera': {
-                'frame':            cam_frame,
-                'odom_frame':       self.frame_id,
-                'K':                K.tolist(),
-                'width':            img_w,
-                'height':           img_h,
-                'T_opt_from_odom':  T_opt_from_odom.tolist(),
+                'frame':           cam_frame,
+                'odom_frame':      self.frame_id,
+                'K':               K.tolist(),
+                'width':           img_w,
+                'height':          img_h,
+                'T_opt_from_odom': proj['T_opt_from_odom'].tolist(),
             },
             'nodes': visible_nodes,
-            'edges': visible_edges,
+            'edges': proj['visible_edges'],
         }
         with open(self._out_dir / f'graph_{idx:06d}.json', 'w') as fh:
             json.dump(graph_data, fh, indent=2)
 
         self.get_logger().info(
             f'[save frame={idx}] t={t_sec:.3f}s '
-            f'visible={len(visible_nodes)} nodes  {len(visible_edges)} edges'
+            f'visible={len(visible_nodes)} nodes  {len(proj["visible_edges"])} edges'
         )
 
 
