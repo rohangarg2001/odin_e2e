@@ -549,15 +549,15 @@ class OdinNavGraphNode(Node):
 
         # nav_graph builder params
         self.declare_parameter('safety_distance', 0.05)
-        self.declare_parameter('merge_node_distance', 0.5)
-        self.declare_parameter('global_merge_distance', 0.5)
+        self.declare_parameter('merge_node_distance', 0.1)
+        self.declare_parameter('global_merge_distance', 0.3)
         self.declare_parameter('global_max_candidate_edge_distance', 1.2)
         self.declare_parameter('free_space_sampling_threshold', 0.5)
 
-        self.declare_parameter('frontier_kernel_size', 5)
-        self.declare_parameter('frontier_odom_threshold', 1.0)
+        self.declare_parameter('frontier_kernel_size', 1)
+        self.declare_parameter('frontier_odom_threshold', 0.05)
         self.declare_parameter('frontier_max_edge_connectivity', 14)
-        self.declare_parameter('minimum_distance_between_frontiers', 0.05)
+        self.declare_parameter('minimum_distance_between_frontiers', 0.1)
         self.declare_parameter('minimum_points_in_cluster', 1)
 
         # Elevation -> traversability params
@@ -580,7 +580,7 @@ class OdinNavGraphNode(Node):
         self.declare_parameter('process_every_n', 1)
         self.declare_parameter('max_cloud_frames', 6000)   # 0 = unlimited; stop graph updates after N frames
         self.declare_parameter('publish_elevation_cloud', True)
-        self.declare_parameter('publish_edges', True)
+        self.declare_parameter('publish_edges', False)
         self.declare_parameter('max_edges_published', 100000)
         # Safety: if the global graph blows up past this many nodes,
         # log a warning and reset.  Healthy operation should stay well
@@ -687,7 +687,7 @@ class OdinNavGraphNode(Node):
             merge_node_distance=float(gp('merge_node_distance')),
             global_merge_distance=float(gp('global_merge_distance')),
             global_max_candidate_edge_distance=float(gp('global_max_candidate_edge_distance')),
-            global_max_candidate_edge_search_distance = 100,
+            global_max_candidate_edge_search_distance = 0.5,
             global_max_connections = 12,
             frontier=FrontierConfig(
                 kernel_size=int(gp('frontier_kernel_size')),
