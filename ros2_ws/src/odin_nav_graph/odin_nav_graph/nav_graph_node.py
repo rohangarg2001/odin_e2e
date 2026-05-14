@@ -549,16 +549,20 @@ class OdinNavGraphNode(Node):
 
         # nav_graph builder params
         self.declare_parameter('safety_distance', 0.05)
-        self.declare_parameter('merge_node_distance', 0.1)
+        self.declare_parameter('merge_node_distance', 0.3)
         self.declare_parameter('global_merge_distance', 0.3)
         self.declare_parameter('global_max_candidate_edge_distance', 1.2)
-        self.declare_parameter('free_space_sampling_threshold', 0.5)
+        self.declare_parameter('free_space_sampling_threshold', 0.15)
 
-        self.declare_parameter('frontier_kernel_size', 1)
-        self.declare_parameter('frontier_odom_threshold', 0.05)
+        self.declare_parameter('frontier_kernel_size', 2)
+        self.declare_parameter('frontier_odom_threshold', 0.3)
         self.declare_parameter('frontier_max_edge_connectivity', 14)
-        self.declare_parameter('minimum_distance_between_frontiers', 0.1)
+        self.declare_parameter('minimum_distance_between_frontiers', 0.02)
         self.declare_parameter('minimum_points_in_cluster', 1)
+
+        self.declare_parameter('min_free_fraction', 0.15)
+        self.declare_parameter('min_unknown_fraction', 0.05)
+        self.declare_parameter('max_occupied_neighbours', 1)
 
         # Elevation -> traversability params
         self.declare_parameter('elev_max_height_diff', 0.3)
@@ -581,6 +585,14 @@ class OdinNavGraphNode(Node):
         self.declare_parameter('max_cloud_frames', 6000)   # 0 = unlimited; stop graph updates after N frames
         self.declare_parameter('publish_elevation_cloud', True)
         self.declare_parameter('publish_edges', False)
+        # Free-space graph nodes: when false, suppresses both ~/graph_nodes and the
+        # blue SPHERE markers in together-mode (frontier rings still publish).  Use
+        # when you only care about visualising frontiers.
+        self.declare_parameter('publish_graph_nodes', True)
+        # Raw (pre-clustering) frontier cells from FrontierDetector, published as
+        # PointCloud2 on ~/raw_frontiers in the odom frame.  Z is 0 + viz_z_offset
+        # because the detector operates on the 2D occupancy grid.
+        self.declare_parameter('publish_raw_frontiers', True)
         self.declare_parameter('max_edges_published', 100000)
         # Safety: if the global graph blows up past this many nodes,
         # log a warning and reset.  Healthy operation should stay well
@@ -620,10 +632,10 @@ class OdinNavGraphNode(Node):
         self.declare_parameter('cam_base_qw',  0.5005)
 
         # ExploRFM (per-image traversability + frontier-score model) → node layers
-        self.declare_parameter('enable_explorfm_layers', False)
+        self.declare_parameter('enable_explorfm_layers', True)
         self.declare_parameter('explorfm_every_n_images', 1)
-        self.declare_parameter('explorfm_frontier_ckpt', '')
-        self.declare_parameter('explorfm_trav_ckpt', '')
+        self.declare_parameter('explorfm_frontier_ckpt', '/home/rohang73/Documents/odin_e2e/nebula2-wildos/ckpts/frontier_head.ckpt')
+        self.declare_parameter('explorfm_trav_ckpt', '/home/rohang73/Documents/odin_e2e/nebula2-wildos/ckpts/trav_head.ckpt')
         self.declare_parameter('explorfm_radio_version', 'c-radio_v3-b')
         self.declare_parameter('explorfm_adaptor_version', '')
         self.declare_parameter('explorfm_adaptor_ckpt_path', '')
@@ -670,9 +682,14 @@ class OdinNavGraphNode(Node):
         self.max_cloud_frames = int(gp('max_cloud_frames'))
         self.publish_elevation_cloud = bool(gp('publish_elevation_cloud'))
         self.publish_edges_flag = bool(gp('publish_edges'))
+        self.publish_graph_nodes_flag = bool(gp('publish_graph_nodes'))
+        self.publish_raw_frontiers_flag = bool(gp('publish_raw_frontiers'))
         self.max_graph_nodes_before_reset = int(gp('max_graph_nodes_before_reset'))
         self._z_lookup_min_filter_radius_cells = int(gp('z_lookup_min_filter_radius_cells'))
         self.viz_z_offset = float(gp('viz_z_offset'))
+        self.max_occupied_neighbours = int(gp('max_occupied_neighbours'))
+        self.min_free_fraction = float(gp('min_free_fraction'))
+        self.min_unknown_fraction = float(gp('min_unknown_fraction'))
         self._viz_mode = str(gp('viz_mode')).strip().lower()
         if self._viz_mode not in ('separate', 'together'):
             self._viz_mode = 'separate'
@@ -695,7 +712,10 @@ class OdinNavGraphNode(Node):
                 max_edge_connectivity=int(gp('frontier_max_edge_connectivity')),
                 minimum_distance_between_frontiers=float(gp('minimum_distance_between_frontiers')),
                 minimum_points_in_cluster=int(gp('minimum_points_in_cluster')),
-                angular_gap_min_gap_deg = 120.0,
+                min_free_fraction=self.min_free_fraction,
+                min_unknown_fraction=self.min_unknown_fraction,
+                max_occupied_neighbours=self.max_occupied_neighbours,
+                angular_gap_min_gap_deg = 120.0
             ),
             elevation_map=ElevationMapConfig(
                 gaussian_sigma=float(gp('elev_gaussian_sigma')),
@@ -766,9 +786,11 @@ class OdinNavGraphNode(Node):
         self.elev_pub = self.create_publisher(PointCloud2, '~/elevation_cloud', 1)
         self.graph_pub = self.create_publisher(PointCloud2, '~/graph_nodes', 1)
         self.frontier_pub = self.create_publisher(PointCloud2, '~/frontier_cloud', 1)
+        # Raw (pre-clustering) frontier cells from FrontierDetector.
+        self.raw_frontier_pub = self.create_publisher(PointCloud2, '~/raw_frontiers', 1)
         self.edges_pub = self.create_publisher(Marker, '~/graph_edges', 1)
         # ExploRFM score clouds — intensity in [0,1], visualise with RViz intensity colormap.
-        self.trav_score_pub = self.create_publisher(PointCloud2, '~/trav_score_cloud', 1)
+        # self.trav_score_pub = self.create_publisher(PointCloud2, '~/trav_score_cloud', 1)
         self.frontier_score_pub = self.create_publisher(PointCloud2, '~/frontier_score_cloud', 1)
         # Per-layer "separate" mode clouds (always-on publishers; only used when viz_mode='separate').
         self.car_score_pub = self.create_publisher(PointCloud2, '~/car_cloud', 1)
@@ -1056,8 +1078,11 @@ class OdinNavGraphNode(Node):
         stamp = msg.header.stamp
         if self.publish_elevation_cloud:
             self._publish_elevation_cloud(stamp)
-        self._publish_graph_nodes(result, stamp)
+        if self.publish_graph_nodes_flag:
+            self._publish_graph_nodes(result, stamp)
         self._publish_frontier_cloud(result, stamp)
+        if self.publish_raw_frontiers_flag:
+            self._publish_raw_frontiers(result, stamp)
         if self.publish_edges_flag:
             self._publish_edges(result, stamp)
         self._publish_score_clouds(result, stamp)
@@ -1143,6 +1168,27 @@ class OdinNavGraphNode(Node):
             scores = result.node_scores[mask, col].cpu().float().numpy()
         self.frontier_pub.publish(self._make_xyz_intensity_cloud(positions, scores, stamp))
 
+    def _publish_raw_frontiers(self, result, stamp) -> None:
+        """Publish the (F, 2) raw frontier cells from FrontierDetector as a
+        PointCloud2 on ~/raw_frontiers.  These are the pre-clustering, pre-
+        node-snapping cells the detector emits straight off the occupancy grid,
+        so they're denser than ~/frontier_cloud and useful for sanity-checking
+        the detection step.  Intensity is set to 1.0 (all-equal) — there's no
+        per-cell score at this stage.
+        """
+        raw = result.frontiers
+        if raw is None or raw.shape[0] == 0:
+            return
+        xy = raw.detach().cpu().numpy().astype(np.float32, copy=True)
+        n = xy.shape[0]
+        pts = np.empty((n, 3), dtype=np.float32)
+        pts[:, :2] = xy
+        # Detector is 2D — sit the cloud at viz_z_offset so it lines up with
+        # the other graph viz in RViz instead of disappearing into the floor.
+        pts[:, 2] = self.viz_z_offset
+        intensities = np.ones(n, dtype=np.float32)
+        self.raw_frontier_pub.publish(self._make_xyz_intensity_cloud(pts, intensities, stamp))
+
     def _publish_edges(self, result, stamp) -> None:
         if result.num_nodes == 0 or result.num_edges == 0:
             return
@@ -1192,7 +1238,8 @@ class OdinNavGraphNode(Node):
 
         'separate' (default): one PointCloud2 per layer; intensity = score in [0, 1].
         'together'         : one MarkerArray combining visited_time (size),
-                             car/tree (colour), frontier (hollow ring).
+                             free nodes (blue spheres), frontier nodes (hollow
+                             ring coloured green→yellow by frontier_score).
         """
         if result.num_nodes == 0 or result.node_scores is None:
             return
@@ -1246,11 +1293,30 @@ class OdinNavGraphNode(Node):
             return
 
         # together
+        if front_scores is None:
+            fs_info = 'None'
+        elif front_mask_np.any():
+            fs_front = front_scores[front_mask_np]
+            fs_info = (
+                f'shape={front_scores.shape} '
+                f'nonzero={int((front_scores != 0).sum())} '
+                f'frontier_nonzero={int((fs_front != 0).sum())}/{fs_front.size} '
+                f'min={float(fs_front.min()):.4f} '
+                f'max={float(fs_front.max()):.4f}'
+            )
+        else:
+            fs_info = (
+                f'shape={front_scores.shape} '
+                f'nonzero={int((front_scores != 0).sum())} (no frontier nodes)'
+            )
+        self.get_logger().info(
+            f"viz together: layers={result.score_layer_names!r} "
+            f"n_frontiers={int(front_mask_np.sum())} front_scores={fs_info}"
+        )
         ma = self._build_together_markers(
             positions=positions,
             front_mask=front_mask_np,
-            car_scores=car_scores,
-            tree_scores=tree_scores,
+            frontier_scores=front_scores,
             visited_scores=visited_scores,
             stamp=stamp,
         )
@@ -1260,19 +1326,20 @@ class OdinNavGraphNode(Node):
         self,
         positions: np.ndarray,
         front_mask: np.ndarray,
-        car_scores: Optional[np.ndarray],
-        tree_scores: Optional[np.ndarray],
+        frontier_scores: Optional[np.ndarray],
         visited_scores: Optional[np.ndarray],
         stamp,
     ) -> MarkerArray:
         """Build the together-mode MarkerArray.
 
         Each node → one Marker:
-            - free-space  → SPHERE
-            - frontier    → LINE_STRIP horizontal ring (hollow)
+            - free-space  → SPHERE, solid blue
+            - frontier    → LINE_STRIP horizontal ring (hollow), coloured on a
+                            green→yellow gradient by ``frontier_scores``
+                            (normalised to the per-frame min/max over frontier
+                            nodes so the spread is visible regardless of scale).
         Size scales linearly with visited_time (normalised to its own max so the
-        spread is visible regardless of run length).  Colour priority is car
-        (blue) > tree (violet) > default (red).
+        spread is visible regardless of run length).
         """
         n = int(positions.shape[0])
         arr = MarkerArray()
@@ -1292,13 +1359,22 @@ class OdinNavGraphNode(Node):
             v_norm = np.zeros(n, dtype=np.float32)
         sizes = self._viz_size_min + (self._viz_size_max - self._viz_size_min) * v_norm
 
-        # Class membership (binary 0/1 layers, but threshold > 0.5 to be safe).
-        car_hit = car_scores > 0.5 if car_scores is not None else np.zeros(n, dtype=bool)
-        tree_hit = tree_scores > 0.5 if tree_scores is not None else np.zeros(n, dtype=bool)
+        # Normalise frontier scores to [0, 1] across the current frame's frontier
+        # nodes for the green→yellow gradient.  Per-frame min/max so the spread
+        # stays readable even when absolute scores cluster tightly.
+        fs_norm = np.zeros(n, dtype=np.float32)
+        if frontier_scores is not None and front_mask.any():
+            fs = frontier_scores.astype(np.float32)
+            fs_front = fs[front_mask]
+            fs_finite = fs_front[np.isfinite(fs_front)]
+            if fs_finite.size > 0:
+                fs_min = float(fs_finite.min())
+                fs_max = float(fs_finite.max())
+                if fs_max > fs_min:
+                    fs_norm = np.clip((fs - fs_min) / (fs_max - fs_min), 0.0, 1.0)
+                    fs_norm[~np.isfinite(fs)] = 0.0
 
-        BLUE   = (0.10, 0.40, 1.00)
-        VIOLET = (0.65, 0.25, 0.95)
-        RED    = (1.00, 0.20, 0.20)
+        BLUE = ColorRGBA(r=0.10, g=0.40, b=1.00, a=1.0)
 
         # Pre-compute the unit ring for hollow frontiers (12 segments + closing point).
         ring_n = 12
@@ -1306,13 +1382,11 @@ class OdinNavGraphNode(Node):
         ring_unit = np.stack([np.cos(thetas), np.sin(thetas), np.zeros_like(thetas)], axis=1)  # (R, 3)
 
         for i in range(n):
-            if car_hit[i]:
-                r, g, b = BLUE
-            elif tree_hit[i]:
-                r, g, b = VIOLET
-            else:
-                r, g, b = RED
-            color = ColorRGBA(r=float(r), g=float(g), b=float(b), a=1.0)
+            is_front = bool(front_mask[i])
+            # Skip free-node spheres when ~/graph_nodes is suppressed; frontier
+            # rings still publish so the user can isolate them in RViz.
+            if not is_front and not self.publish_graph_nodes_flag:
+                continue
 
             m = Marker()
             m.header = Header(stamp=stamp, frame_id=self.frame_id)
@@ -1320,13 +1394,16 @@ class OdinNavGraphNode(Node):
             m.action = Marker.ADD
             m.pose.orientation.w = 1.0  # identity
 
-            if front_mask[i]:
+            if is_front:
+                # Pink (low, 1.0, 0.4, 0.7) → Yellow (high, 1.0, 1.0, 0.0).
+                # R stays at 1, G rises 0.4→1.0, B falls 0.7→0.0.
+                t = float(fs_norm[i])
                 m.ns = 'frontiers'
                 m.type = Marker.LINE_STRIP
                 # LINE_STRIP uses scale.x as line width.  Pick something that reads at
                 # the chosen ring radius.
                 m.scale.x = max(0.03, 0.15 * float(sizes[i]))
-                m.color = color
+                m.color = ColorRGBA(r=1.0, g=0.4 + 0.6 * t, b=0.7 * (1.0 - t), a=1.0)
                 ring = positions[i] + ring_unit * float(sizes[i])
                 m.points = [
                     Point(x=float(p[0]), y=float(p[1]), z=float(p[2])) for p in ring
@@ -1338,7 +1415,7 @@ class OdinNavGraphNode(Node):
                 m.scale.x = s
                 m.scale.y = s
                 m.scale.z = s
-                m.color = color
+                m.color = BLUE
                 m.pose.position.x = float(positions[i, 0])
                 m.pose.position.y = float(positions[i, 1])
                 m.pose.position.z = float(positions[i, 2])
