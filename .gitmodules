@@ -1,6 +1,6 @@
 [submodule "nav_graph_gpu"]
 	path = nav_graph_gpu
-	url = https://github.com/GoldenGait/nav_graph_gpu
+	url = git@github.com:GoldenGait/nav_graph_gpu.git
 [submodule "nebula2-wildos"]
 	path = nebula2-wildos
-	url = https://github.com/rohangarg2001/nebula2-wildos
+	url = git@github.com:rohangarg2001/nebula2-wildos.git
