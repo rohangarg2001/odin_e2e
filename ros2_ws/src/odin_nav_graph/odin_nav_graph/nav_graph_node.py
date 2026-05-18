@@ -42,8 +42,8 @@ from rclpy.node import Node
 
 from sensor_msgs.msg import PointCloud2, PointField, Image, CameraInfo
 from nav_msgs.msg import Odometry, OccupancyGrid, MapMetaData
-from std_msgs.msg import Header, ColorRGBA
-from visualization_msgs.msg import Marker, MarkerArray
+from std_msgs.msg import Header
+from visualization_msgs.msg import Marker
 from geometry_msgs.msg import Point, Pose, Quaternion
 import base64
 import cv2
@@ -108,7 +108,12 @@ from nav_graph import (  # noqa: E402
     ExplorationConfig,
     ElevationMapConfig,
 )
-from nav_graph.core.graph_layer import ExternalLayer, MergePolicy  # noqa: E402
+from nav_graph.core.graph_layer import (  # noqa: E402
+    ComputeLayer,
+    ExternalLayer,
+    GraphContext,
+    MergePolicy,
+)
 
 from odin_nav_graph.elevation_map import ElevationMapWrapper  # noqa: E402
 
@@ -521,6 +526,53 @@ class VisitedTimeLayer(ExternalLayer):
         return counts / float(self.total_frames)
 
 
+class PathProximityLayer(ComputeLayer):
+    """Scores every node by closeness to the robot's travelled path.
+
+    Each ``compute()`` appends the robot's current xy to an internal path
+    buffer (gated by ``min_step`` so the buffer stays sparse, capped at
+    ``max_points``), then scores every node ``1 / (1 + falloff * d)`` where
+    ``d`` is the distance to the nearest path point.  All on the GPU.
+    """
+
+    name = 'path_proximity'
+
+    def __init__(
+        self,
+        layer_name: str = 'path_proximity',
+        falloff: float = 0.5,
+        min_step: float = 0.2,
+        max_points: int = 8000,
+    ) -> None:
+        self.name = layer_name
+        self.falloff = float(falloff)
+        self._min_step_sq = float(min_step) ** 2
+        self._max_points = int(max_points)
+        self._path: list = []  # list of (x, y) in the odom frame
+
+    def compute(self, ctx: GraphContext) -> torch.Tensor:
+        # Append the current robot xy, gated by the minimum step.
+        if ctx.robot_position is not None:
+            x, y = ctx.robot_position
+            if not self._path:
+                self._path.append((x, y))
+            else:
+                lx, ly = self._path[-1]
+                if (x - lx) ** 2 + (y - ly) ** 2 >= self._min_step_sq:
+                    self._path.append((x, y))
+                    if len(self._path) > self._max_points:
+                        del self._path[:-self._max_points]
+
+        n = ctx.num_nodes
+        if n == 0 or not self._path:
+            return torch.zeros(n, dtype=torch.float32, device=ctx.device)
+
+        node_xy = ctx.node_positions[:, :2].contiguous()
+        path_xy = torch.tensor(self._path, dtype=torch.float32, device=ctx.device)
+        dmin = torch.cdist(node_xy, path_xy).amin(dim=1)
+        return 1.0 / (1.0 + self.falloff * dmin)
+
+
 # ─────────────────────────────────────────────────────────────────────
 #  Node
 # ─────────────────────────────────────────────────────────────────────
@@ -578,7 +630,7 @@ class OdinNavGraphNode(Node):
 
         # Throttling / publishing
         self.declare_parameter('process_every_n', 1)
-        self.declare_parameter('max_cloud_frames', 6000)   # 0 = unlimited; stop graph updates after N frames
+        self.declare_parameter('max_cloud_frames', 10000)   # 0 = unlimited; stop graph updates after N frames  #200 when starting from 200s
         self.declare_parameter('publish_elevation_cloud', True)
         self.declare_parameter('publish_edges', True)
         self.declare_parameter('max_edges_published', 100000)
@@ -601,8 +653,8 @@ class OdinNavGraphNode(Node):
         # RGB + graph saver
         self.declare_parameter('out_directory', '')
         self.declare_parameter('save_every_n_frames', 5)
-        self.declare_parameter('save_frame_start', 100)   # first _rgb_count to save (80*20)
-        self.declare_parameter('save_frame_end',   6000)   # last  _rgb_count to save (120*20)
+        self.declare_parameter('save_frame_start', 7000)   # first _rgb_count to save (80*20)
+        self.declare_parameter('save_frame_end',   7000)   # last  _rgb_count to save (120*20)
         self.declare_parameter('cam_image_topic', '/odin1/image/undistorted')
         self.declare_parameter('cam_info_topic', '/odin1/camera_info')
         self.declare_parameter('cam_frame', 'camera_optical')  # label for JSON only
@@ -635,22 +687,29 @@ class OdinNavGraphNode(Node):
         self.declare_parameter('explorfm_frontier_layer', 'frontier_score')
         self.declare_parameter('explorfm_car_detector_layer', 'car')
         self.declare_parameter('explorfm_tree_detector_layer', 'tree')
-        # Cosine similarity above this → node is flagged 1 in the matching object layer.
-        self.declare_parameter('explorfm_object_threshold', 0.20)
+        # Image-space object scoring:
+        #   explorfm_object_std_k     — a pixel counts as a "high car/tree region"
+        #       when its sim exceeds mean + k·std of that frame's sim map.
+        #   explorfm_object_threshold — optional absolute floor on that adaptive
+        #       cutoff (0.0 = floor disabled, pure relative thresholding).
+        #   explorfm_object_uv_radius — a node within this many pixels of a high
+        #       region picks up that region's score.
+        self.declare_parameter('explorfm_object_std_k', 3.0)
+        self.declare_parameter('explorfm_object_threshold', 0.0)
+        self.declare_parameter('explorfm_object_uv_radius', 25)
 
         # Visited-time layer (per-node fraction of frames the robot was nearest to it).
         self.declare_parameter('enable_visited_time_layer', True)
         self.declare_parameter('visited_time_layer', 'visited_time')
 
-        # Layer visualisation mode.
-        #   'separate' — one PointCloud2 per layer (intensity = score); RViz colours per topic.
-        #   'together' — single MarkerArray combining visited_time (size), car/tree (colour),
-        #                with frontier nodes drawn as hollow rings.
-        self.declare_parameter('viz_mode', 'together')
-        # Together-mode size envelope (in metres).  Visited-time score in [0,1] maps linearly
-        # from min → max.  The user said 0.1–0.5 is comfortably visible in RViz.
-        self.declare_parameter('viz_size_min', 0.1)
-        self.declare_parameter('viz_size_max', 0.5)
+        # Path-proximity layer (per-node closeness to the robot's travelled path).
+        self.declare_parameter('enable_path_proximity_layer', True)
+        self.declare_parameter('path_proximity_layer', 'path_proximity')
+
+        # Per-node proximity falloff for the car / tree / path layers.
+        # score = 1 / (1 + falloff * distance_to_nearest_source) → 1 on top of a
+        # source, decaying with distance.  0.5 ⇒ score ≈ 0.5 at 2 m away.
+        self.declare_parameter('layer_proximity_falloff', 0.5)
 
         gp = lambda n: self.get_parameter(n).value  # noqa: E731
         cloud_topic = gp('cloud_topic')
@@ -673,11 +732,7 @@ class OdinNavGraphNode(Node):
         self.max_graph_nodes_before_reset = int(gp('max_graph_nodes_before_reset'))
         self._z_lookup_min_filter_radius_cells = int(gp('z_lookup_min_filter_radius_cells'))
         self.viz_z_offset = float(gp('viz_z_offset'))
-        self._viz_mode = str(gp('viz_mode')).strip().lower()
-        if self._viz_mode not in ('separate', 'together'):
-            self._viz_mode = 'separate'
-        self._viz_size_min = float(gp('viz_size_min'))
-        self._viz_size_max = float(gp('viz_size_max'))
+        self._layer_falloff = float(gp('layer_proximity_falloff'))
         self.max_edges_published = int(gp('max_edges_published'))
 
         # ── nav_graph config ──────────────────────────────────────────
@@ -739,6 +794,20 @@ class OdinNavGraphNode(Node):
                 '(weight=0.0 — ingest-only).'
             )
 
+        # Path-proximity layer: a ComputeLayer that appends the robot xy each
+        # compute_layers() pass and scores nodes by closeness to that path.
+        self.path_proximity_layer: Optional[PathProximityLayer] = None
+        if bool(gp('enable_path_proximity_layer')):
+            self.path_proximity_layer = PathProximityLayer(
+                layer_name=str(gp('path_proximity_layer')),
+                falloff=self._layer_falloff,
+            )
+            self.builder.add_layer(self.path_proximity_layer, weight=0.0)
+            self.get_logger().info(
+                f'Path-proximity layer registered as {self.path_proximity_layer.name!r} '
+                '(weight=0.0 — GPU compute, viz-only).'
+            )
+
         # ── Rolling elevation map (elevation_mapping_cupy) ────────────
         self.get_logger().info('Initialising ElevationMap (elevation_mapping_cupy)...')
         self.emap = ElevationMapWrapper(
@@ -767,15 +836,15 @@ class OdinNavGraphNode(Node):
         self.graph_pub = self.create_publisher(PointCloud2, '~/graph_nodes', 1)
         self.frontier_pub = self.create_publisher(PointCloud2, '~/frontier_cloud', 1)
         self.edges_pub = self.create_publisher(Marker, '~/graph_edges', 1)
-        # ExploRFM score clouds — intensity in [0,1], visualise with RViz intensity colormap.
-        self.trav_score_pub = self.create_publisher(PointCloud2, '~/trav_score_cloud', 1)
+        # Layer visualisation clouds — intensity in [0,1], colour with RViz intensity colormap.
+        #   ~/frontier_score_cloud  — frontier nodes, ExploRFM frontier score.
+        #   ~/car_layer             — all nodes, closeness to a detected car.
+        #   ~/tree_layer            — all nodes, closeness to a detected tree.
+        #   ~/path_proximity_layer  — all nodes, closeness to the robot path.
         self.frontier_score_pub = self.create_publisher(PointCloud2, '~/frontier_score_cloud', 1)
-        # Per-layer "separate" mode clouds (always-on publishers; only used when viz_mode='separate').
-        self.car_score_pub = self.create_publisher(PointCloud2, '~/car_cloud', 1)
-        self.tree_score_pub = self.create_publisher(PointCloud2, '~/tree_cloud', 1)
-        self.visited_time_pub = self.create_publisher(PointCloud2, '~/visited_time_cloud', 1)
-        # "Together" mode: one MarkerArray with per-node SPHERE/ring + size + colour.
-        self.together_pub = self.create_publisher(MarkerArray, '~/together_markers', 1)
+        self.car_layer_pub = self.create_publisher(PointCloud2, '~/car_layer', 1)
+        self.tree_layer_pub = self.create_publisher(PointCloud2, '~/tree_layer', 1)
+        self.path_prox_pub = self.create_publisher(PointCloud2, '~/path_proximity_layer', 1)
         # Extended global occupancy grid used for edge collision checking inside GlobalGraphGenerator.
         self.global_occ_pub = self.create_publisher(OccupancyGrid, '~/global_occ_grid', 1)
 
@@ -826,6 +895,8 @@ class OdinNavGraphNode(Node):
         self._car_layer_name = str(gp('explorfm_car_detector_layer'))
         self._tree_layer_name = str(gp('explorfm_tree_detector_layer'))
         self._object_threshold = float(gp('explorfm_object_threshold'))
+        self._object_std_k = float(gp('explorfm_object_std_k'))
+        self._object_uv_radius = max(0, int(gp('explorfm_object_uv_radius')))
         # Order matters — must match self._object_layer_names below.
         self.object_queries = ['car', 'tree']
         self._object_layer_names = [self._car_layer_name, self._tree_layer_name]
@@ -1133,15 +1204,9 @@ class OdinNavGraphNode(Node):
             return
         positions = result.node_positions[mask].cpu().numpy().astype(np.float32, copy=True)
         positions[:, 2] += self.viz_z_offset
-        scores = np.zeros(positions.shape[0], dtype=np.float32)
-        if (
-            result.node_scores is not None
-            and result.score_layer_names
-            and 'combined' in result.score_layer_names
-        ):
-            col = result.score_layer_names.index('combined')
-            scores = result.node_scores[mask, col].cpu().float().numpy()
-        self.frontier_pub.publish(self._make_xyz_intensity_cloud(positions, scores, stamp))
+        # Flat colour — constant intensity so RViz renders one solid colour.
+        flat = np.ones(positions.shape[0], dtype=np.float32)
+        self.frontier_pub.publish(self._make_xyz_intensity_cloud(positions, flat, stamp))
 
     def _publish_edges(self, result, stamp) -> None:
         if result.num_nodes == 0 or result.num_edges == 0:
@@ -1188,164 +1253,57 @@ class OdinNavGraphNode(Node):
         self.edges_pub.publish(m)
 
     def _publish_score_clouds(self, result, stamp) -> None:
-        """Publish layer scores according to ``self._viz_mode``.
+        """Publish the per-layer visualisation clouds.
 
-        'separate' (default): one PointCloud2 per layer; intensity = score in [0, 1].
-        'together'         : one MarkerArray combining visited_time (size),
-                             car/tree (colour), frontier (hollow ring).
+        ~/frontier_score_cloud  — frontier nodes, ExploRFM frontier score.
+        ~/car_layer             — all nodes, per-frame car score (ExploRFM).
+        ~/tree_layer            — all nodes, per-frame tree score (ExploRFM).
+        ~/path_proximity_layer  — all nodes, closeness to the robot path.
+
+        Car/tree/path scores are produced upstream (ExploRFM ingest and the
+        path-proximity ComputeLayer) — here we just read the columns out of
+        ``result.node_scores`` and pack them into clouds.
         """
-        if result.num_nodes == 0 or result.node_scores is None:
-            return
-        names = result.score_layer_names
-        if not names:
+        if result.num_nodes == 0:
             return
 
-        positions = result.node_positions.cpu().numpy().astype(np.float32, copy=True)
-        positions[:, 2] += self.viz_z_offset
-        node_types = result.node_types.cpu().numpy()
-        front_mask_np = node_types == 2
+        pos = result.node_positions                       # (N, 3) CUDA
+        # One device→host transfer for the shared xyz buffer.
+        pos_np = pos.detach().cpu().numpy().astype(np.float32, copy=True)
+        pos_np[:, 2] += self.viz_z_offset
 
-        def _score_col(layer_name: str) -> Optional[np.ndarray]:
-            if not layer_name or layer_name not in names:
-                return None
-            col = names.index(layer_name)
-            return result.node_scores[:, col].cpu().float().numpy()
+        names = result.score_layer_names or []
+        scores = result.node_scores
 
-        car_scores = _score_col(self._car_layer_name)
-        tree_scores = _score_col(self._tree_layer_name)
-        visited_scores = _score_col(
-            self.visited_time_layer.name if self.visited_time_layer is not None else ''
-        )
-        trav_scores = _score_col(self._trav_layer_name)
-        front_scores = _score_col(self._front_layer_name)
+        # ── scored frontiers — ExploRFM frontier layer, frontier nodes only ──
+        front_mask = result.node_types == 2
+        if (scores is not None and self._front_layer_name in names
+                and bool(front_mask.any())):
+            col = names.index(self._front_layer_name)
+            fm_np = front_mask.detach().cpu().numpy()
+            fscore = scores[front_mask, col].detach().cpu().float().numpy()
+            self.frontier_score_pub.publish(
+                self._make_xyz_intensity_cloud(pos_np[fm_np], fscore, stamp),
+            )
 
-        if self._viz_mode == 'separate':
-            # Per-layer clouds, all nodes; RViz colours per topic.
-            if trav_scores is not None:
-                self.trav_score_pub.publish(
-                    self._make_xyz_intensity_cloud(positions, trav_scores, stamp),
-                )
-            if front_scores is not None and front_mask_np.any():
-                self.frontier_score_pub.publish(
-                    self._make_xyz_intensity_cloud(
-                        positions[front_mask_np], front_scores[front_mask_np], stamp,
-                    ),
-                )
-            if car_scores is not None:
-                self.car_score_pub.publish(
-                    self._make_xyz_intensity_cloud(positions, car_scores, stamp),
-                )
-            if tree_scores is not None:
-                self.tree_score_pub.publish(
-                    self._make_xyz_intensity_cloud(positions, tree_scores, stamp),
-                )
-            if visited_scores is not None:
-                self.visited_time_pub.publish(
-                    self._make_xyz_intensity_cloud(positions, visited_scores, stamp),
-                )
-            return
+        # ── car / tree layers — read the ingested score column directly ──────
+        for layer_name, pub in (
+            (self._car_layer_name, self.car_layer_pub),
+            (self._tree_layer_name, self.tree_layer_pub),
+        ):
+            if scores is not None and layer_name in names:
+                col = names.index(layer_name)
+                vals = scores[:, col].detach().cpu().float().numpy()
+                pub.publish(self._make_xyz_intensity_cloud(pos_np, vals, stamp))
 
-        # together
-        ma = self._build_together_markers(
-            positions=positions,
-            front_mask=front_mask_np,
-            car_scores=car_scores,
-            tree_scores=tree_scores,
-            visited_scores=visited_scores,
-            stamp=stamp,
-        )
-        self.together_pub.publish(ma)
-
-    def _build_together_markers(
-        self,
-        positions: np.ndarray,
-        front_mask: np.ndarray,
-        car_scores: Optional[np.ndarray],
-        tree_scores: Optional[np.ndarray],
-        visited_scores: Optional[np.ndarray],
-        stamp,
-    ) -> MarkerArray:
-        """Build the together-mode MarkerArray.
-
-        Each node → one Marker:
-            - free-space  → SPHERE
-            - frontier    → LINE_STRIP horizontal ring (hollow)
-        Size scales linearly with visited_time (normalised to its own max so the
-        spread is visible regardless of run length).  Colour priority is car
-        (blue) > tree (violet) > default (red).
-        """
-        n = int(positions.shape[0])
-        arr = MarkerArray()
-
-        # Wipe last frame's markers so stale spheres don't linger.
-        clear = Marker()
-        clear.header = Header(stamp=stamp, frame_id=self.frame_id)
-        clear.action = Marker.DELETEALL
-        arr.markers.append(clear)
-
-        # Visited-time → size in [_viz_size_min, _viz_size_max], normalised to per-frame max.
-        if visited_scores is not None and n > 0:
-            v = np.clip(visited_scores.astype(np.float32), 0.0, None)
-            v_max = float(v.max())
-            v_norm = v / v_max if v_max > 0.0 else np.zeros_like(v)
-        else:
-            v_norm = np.zeros(n, dtype=np.float32)
-        sizes = self._viz_size_min + (self._viz_size_max - self._viz_size_min) * v_norm
-
-        # Class membership (binary 0/1 layers, but threshold > 0.5 to be safe).
-        car_hit = car_scores > 0.5 if car_scores is not None else np.zeros(n, dtype=bool)
-        tree_hit = tree_scores > 0.5 if tree_scores is not None else np.zeros(n, dtype=bool)
-
-        BLUE   = (0.10, 0.40, 1.00)
-        VIOLET = (0.65, 0.25, 0.95)
-        RED    = (1.00, 0.20, 0.20)
-
-        # Pre-compute the unit ring for hollow frontiers (12 segments + closing point).
-        ring_n = 12
-        thetas = np.linspace(0.0, 2.0 * np.pi, ring_n + 1, dtype=np.float32)
-        ring_unit = np.stack([np.cos(thetas), np.sin(thetas), np.zeros_like(thetas)], axis=1)  # (R, 3)
-
-        for i in range(n):
-            if car_hit[i]:
-                r, g, b = BLUE
-            elif tree_hit[i]:
-                r, g, b = VIOLET
-            else:
-                r, g, b = RED
-            color = ColorRGBA(r=float(r), g=float(g), b=float(b), a=1.0)
-
-            m = Marker()
-            m.header = Header(stamp=stamp, frame_id=self.frame_id)
-            m.id = i
-            m.action = Marker.ADD
-            m.pose.orientation.w = 1.0  # identity
-
-            if front_mask[i]:
-                m.ns = 'frontiers'
-                m.type = Marker.LINE_STRIP
-                # LINE_STRIP uses scale.x as line width.  Pick something that reads at
-                # the chosen ring radius.
-                m.scale.x = max(0.03, 0.15 * float(sizes[i]))
-                m.color = color
-                ring = positions[i] + ring_unit * float(sizes[i])
-                m.points = [
-                    Point(x=float(p[0]), y=float(p[1]), z=float(p[2])) for p in ring
-                ]
-            else:
-                m.ns = 'free'
-                m.type = Marker.SPHERE
-                s = float(sizes[i])
-                m.scale.x = s
-                m.scale.y = s
-                m.scale.z = s
-                m.color = color
-                m.pose.position.x = float(positions[i, 0])
-                m.pose.position.y = float(positions[i, 1])
-                m.pose.position.z = float(positions[i, 2])
-
-            arr.markers.append(m)
-
-        return arr
+        # ── path-proximity layer — read straight from the registered layer ──
+        if (self.path_proximity_layer is not None and scores is not None
+                and self.path_proximity_layer.name in names):
+            col = names.index(self.path_proximity_layer.name)
+            path_score = scores[:, col].detach().cpu().float().numpy()
+            self.path_prox_pub.publish(
+                self._make_xyz_intensity_cloud(pos_np, path_score, stamp),
+            )
 
     def _publish_global_occ_grid(self, stamp) -> None:
         """Publish the extended sliding-window occupancy grid from GlobalGraphGenerator.
@@ -1738,29 +1696,53 @@ class OdinNavGraphNode(Node):
             )
             self.builder.ingest_layer_scores(self._front_layer_name, front_ids_t, front_vals_t)
 
-        # Per-node object detection (car / tree) via SigLIP2 text-patch similarity.
-        # Sampled at each visible node's pixel; binary 1 where cosine sim exceeds
-        # self._object_threshold, else 0.  Ingested into _car/_tree layer names.
+        # Per-node object scoring (car / tree) in image space.
+        #   1. SigLIP2 text-patch cosine similarity → per-pixel car/tree heatmap.
+        #   2. Keep only "high" pixels (sim > threshold); zero the rest.
+        #   3. Dilate by the UV radius (max-pool) so a node within `radius` px of
+        #      a high region inherits that region's score.
+        #   4. Sample the dilated map at every visible node's pixel.
+        #   5. Normalise per frame (÷ per-frame max) and ingest into car/tree.
+        # All of steps 1-3 run on the GPU.
         obj_hits_log = ''
         if self._object_text_emb is not None:
             patch = F.normalize(ad_feats_t.float(), dim=1)                        # (1, D, h, w)
             sim = torch.einsum('nd,bdhw->bnhw', self._object_text_emb, patch)     # (1, Q, h, w)
             sim_full = F.interpolate(
                 sim, size=rgb.shape[:2], mode='bilinear', align_corners=False,
-            )[0]                                                                  # (Q, H, W)
-            sim_np = sim_full.detach().float().cpu().numpy()
+            )                                                                     # (1, Q, H, W)
+            # "High region" = per-frame, per-query adaptive threshold:
+            # mean + k·std of that query's sim map (raw SigLIP2 cosine values
+            # are uncalibrated and differ per query, so an absolute cutoff
+            # cannot serve both car and tree).  An optional absolute floor
+            # (explorfm_object_threshold) clamps it from below.
+            q_mean = sim_full.mean(dim=(2, 3), keepdim=True)                     # (1, Q, 1, 1)
+            q_std = sim_full.std(dim=(2, 3), keepdim=True)                       # (1, Q, 1, 1)
+            thr = torch.clamp(
+                q_mean + self._object_std_k * q_std, min=self._object_threshold,
+            )
+            high = sim_full * (sim_full > thr).float()
+            r = self._object_uv_radius
+            dilated = F.max_pool2d(high, kernel_size=2 * r + 1, stride=1, padding=r)
+            dilated_np = dilated[0].detach().float().cpu().numpy()                # (Q, H, W)
+            sim_max = sim_full[0].amax(dim=(1, 2)).detach().cpu().numpy()         # (Q,)
+            thr_np = thr[0, :, 0, 0].detach().cpu().numpy()                       # (Q,)
 
             ids_t_obj = torch.from_numpy(ids_np).to(device=device, dtype=torch.long)
-            counts: list[int] = []
+            log_parts: list[str] = []
             for qi, layer_name in enumerate(self._object_layer_names):
-                vals_q = sim_np[qi, v, u]
-                labels_q = (vals_q > self._object_threshold).astype(np.float32)
-                labels_t = torch.from_numpy(labels_q).to(device=device, dtype=torch.float32)
-                self.builder.ingest_layer_scores(layer_name, ids_t_obj, labels_t)
-                counts.append(int(labels_q.sum()))
-            obj_hits_log = ' ' + ' '.join(
-                f'{q}={c}' for q, c in zip(self.object_queries, counts)
-            )
+                vals_q = dilated_np[qi, v, u].astype(np.float32)                  # per-node score
+                vmax = float(vals_q.max()) if vals_q.size else 0.0
+                # Per-frame normalisation; all-zero frames stay all-zero.
+                norm_q = vals_q / vmax if vmax > 0.0 else vals_q
+                norm_t = torch.from_numpy(norm_q).to(device=device, dtype=torch.float32)
+                self.builder.ingest_layer_scores(layer_name, ids_t_obj, norm_t)
+                log_parts.append(
+                    f'{self.object_queries[qi]}[sim_max={sim_max[qi]:.3f} '
+                    f'thr={thr_np[qi]:.3f} '
+                    f'nodes_hit={int((vals_q > 0).sum())}]'
+                )
+            obj_hits_log = ' ' + ' '.join(log_parts)
 
         self.get_logger().info(
             f'[explorfm rgb={self._rgb_count}] infer={infer_ms:.1f}ms '

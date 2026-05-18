@@ -237,3 +237,4 @@ saved_outputs_odin/
 install/
 log/
 .vscode/
+e2e_debug_overlays
