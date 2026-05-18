@@ -549,19 +549,19 @@ class OdinNavGraphNode(Node):
 
         # nav_graph builder params
         self.declare_parameter('safety_distance', 0.05)
-        self.declare_parameter('merge_node_distance', 0.3)
-        self.declare_parameter('global_merge_distance', 0.3)
+        self.declare_parameter('merge_node_distance', 0.24)
+        self.declare_parameter('global_merge_distance', 0.24)
         self.declare_parameter('global_max_candidate_edge_distance', 1.2)
-        self.declare_parameter('free_space_sampling_threshold', 0.15)
+        self.declare_parameter('free_space_sampling_threshold', 0.24)
 
-        self.declare_parameter('frontier_kernel_size', 2)
+        self.declare_parameter('frontier_kernel_size', 3)
         self.declare_parameter('frontier_odom_threshold', 0.3)
         self.declare_parameter('frontier_max_edge_connectivity', 14)
         self.declare_parameter('minimum_distance_between_frontiers', 0.02)
         self.declare_parameter('minimum_points_in_cluster', 1)
 
         self.declare_parameter('min_free_fraction', 0.15)
-        self.declare_parameter('min_unknown_fraction', 0.05)
+        self.declare_parameter('min_unknown_fraction', 0.04)
         self.declare_parameter('max_occupied_neighbours', 1)
 
         # Elevation -> traversability params
@@ -633,7 +633,7 @@ class OdinNavGraphNode(Node):
 
         # ExploRFM (per-image traversability + frontier-score model) → node layers
         self.declare_parameter('enable_explorfm_layers', True)
-        self.declare_parameter('explorfm_every_n_images', 1)
+        self.declare_parameter('explorfm_every_n_images', 4)
         self.declare_parameter('explorfm_frontier_ckpt', '/home/rohang73/Documents/odin_e2e/nebula2-wildos/ckpts/frontier_head.ckpt')
         self.declare_parameter('explorfm_trav_ckpt', '/home/rohang73/Documents/odin_e2e/nebula2-wildos/ckpts/trav_head.ckpt')
         self.declare_parameter('explorfm_radio_version', 'c-radio_v3-b')
@@ -643,12 +643,7 @@ class OdinNavGraphNode(Node):
         self.declare_parameter('explorfm_radio_dim', 768)
         self.declare_parameter('explorfm_static_scale_factor', 0.5)
         self.declare_parameter('explorfm_precision', 'FP16')
-        self.declare_parameter('explorfm_trav_layer', 'traversability')
         self.declare_parameter('explorfm_frontier_layer', 'frontier_score')
-        self.declare_parameter('explorfm_car_detector_layer', 'car')
-        self.declare_parameter('explorfm_tree_detector_layer', 'tree')
-        # Cosine similarity above this → node is flagged 1 in the matching object layer.
-        self.declare_parameter('explorfm_object_threshold', 0.20)
 
         # Visited-time layer (per-node fraction of frames the robot was nearest to it).
         self.declare_parameter('enable_visited_time_layer', True)
@@ -656,9 +651,8 @@ class OdinNavGraphNode(Node):
 
         # Layer visualisation mode.
         #   'separate' — one PointCloud2 per layer (intensity = score); RViz colours per topic.
-        #   'together' — single MarkerArray combining visited_time (size), car/tree (colour),
-        #                with frontier nodes drawn as hollow rings.
-        self.declare_parameter('viz_mode', 'together')
+        #   'together' — single MarkerArray combining visited_time (size) + frontier rings.
+        self.declare_parameter('viz_mode', 'seperate')
         # Together-mode size envelope (in metres).  Visited-time score in [0,1] maps linearly
         # from min → max.  The user said 0.1–0.5 is comfortably visible in RViz.
         self.declare_parameter('viz_size_min', 0.1)
@@ -789,12 +783,7 @@ class OdinNavGraphNode(Node):
         # Raw (pre-clustering) frontier cells from FrontierDetector.
         self.raw_frontier_pub = self.create_publisher(PointCloud2, '~/raw_frontiers', 1)
         self.edges_pub = self.create_publisher(Marker, '~/graph_edges', 1)
-        # ExploRFM score clouds — intensity in [0,1], visualise with RViz intensity colormap.
-        # self.trav_score_pub = self.create_publisher(PointCloud2, '~/trav_score_cloud', 1)
         self.frontier_score_pub = self.create_publisher(PointCloud2, '~/frontier_score_cloud', 1)
-        # Per-layer "separate" mode clouds (always-on publishers; only used when viz_mode='separate').
-        self.car_score_pub = self.create_publisher(PointCloud2, '~/car_cloud', 1)
-        self.tree_score_pub = self.create_publisher(PointCloud2, '~/tree_cloud', 1)
         self.visited_time_pub = self.create_publisher(PointCloud2, '~/visited_time_cloud', 1)
         # "Together" mode: one MarkerArray with per-node SPHERE/ring + size + colour.
         self.together_pub = self.create_publisher(MarkerArray, '~/together_markers', 1)
@@ -843,16 +832,7 @@ class OdinNavGraphNode(Node):
         # ── ExploRFM model + per-node layers ──────────────────────────
         self._explorfm = None
         self._explorfm_every_n = max(1, int(gp('explorfm_every_n_images')))
-        self._trav_layer_name = str(gp('explorfm_trav_layer'))
         self._front_layer_name = str(gp('explorfm_frontier_layer'))
-        self._car_layer_name = str(gp('explorfm_car_detector_layer'))
-        self._tree_layer_name = str(gp('explorfm_tree_detector_layer'))
-        self._object_threshold = float(gp('explorfm_object_threshold'))
-        # Order matters — must match self._object_layer_names below.
-        self.object_queries = ['car', 'tree']
-        self._object_layer_names = [self._car_layer_name, self._tree_layer_name]
-        # Cached text embeddings for self.object_queries (set in _init_explorfm).
-        self._object_text_emb: Optional[torch.Tensor] = None
         if bool(gp('enable_explorfm_layers')):
             self._init_explorfm(gp)
 
@@ -1162,9 +1142,9 @@ class OdinNavGraphNode(Node):
         if (
             result.node_scores is not None
             and result.score_layer_names
-            and 'combined' in result.score_layer_names
+            and 'frontier_score' in result.score_layer_names
         ):
-            col = result.score_layer_names.index('combined')
+            col = result.score_layer_names.index('frontier_score')
             scores = result.node_scores[mask, col].cpu().float().numpy()
         self.frontier_pub.publish(self._make_xyz_intensity_cloud(positions, scores, stamp))
 
@@ -1258,33 +1238,17 @@ class OdinNavGraphNode(Node):
             col = names.index(layer_name)
             return result.node_scores[:, col].cpu().float().numpy()
 
-        car_scores = _score_col(self._car_layer_name)
-        tree_scores = _score_col(self._tree_layer_name)
         visited_scores = _score_col(
             self.visited_time_layer.name if self.visited_time_layer is not None else ''
         )
-        trav_scores = _score_col(self._trav_layer_name)
         front_scores = _score_col(self._front_layer_name)
 
         if self._viz_mode == 'separate':
-            # Per-layer clouds, all nodes; RViz colours per topic.
-            if trav_scores is not None:
-                self.trav_score_pub.publish(
-                    self._make_xyz_intensity_cloud(positions, trav_scores, stamp),
-                )
             if front_scores is not None and front_mask_np.any():
                 self.frontier_score_pub.publish(
                     self._make_xyz_intensity_cloud(
                         positions[front_mask_np], front_scores[front_mask_np], stamp,
                     ),
-                )
-            if car_scores is not None:
-                self.car_score_pub.publish(
-                    self._make_xyz_intensity_cloud(positions, car_scores, stamp),
-                )
-            if tree_scores is not None:
-                self.tree_score_pub.publish(
-                    self._make_xyz_intensity_cloud(positions, tree_scores, stamp),
                 )
             if visited_scores is not None:
                 self.visited_time_pub.publish(
@@ -1533,48 +1497,14 @@ class OdinNavGraphNode(Node):
             self._explorfm = None
             return
 
-        # Register two persistent layers (REPLACE on each ingest) so every
-        # cloud-frame compute_layers() pass sees the most recent observation.
-        # Traversability layer disabled.
-        # self.builder.add_layer(
-        #     ExternalLayer(self._trav_layer_name, ingest_policy=MergePolicy.REPLACE),
-        #     weight=0.0,
-        # )
         self.builder.add_layer(
             ExternalLayer(self._front_layer_name, ingest_policy=MergePolicy.REPLACE),
             weight=0.0,
         )
-        self.builder.add_layer(
-            ExternalLayer(self._car_layer_name, ingest_policy=MergePolicy.REPLACE),
-            weight=0.0
-        )
-        self.builder.add_layer(
-            ExternalLayer(self._tree_layer_name, ingest_policy=MergePolicy.REPLACE),
-            weight=0.0
-        )
         self.get_logger().info(
-            f'ExploRFM ready. Layers registered: '
-            f'{self._trav_layer_name!r}, {self._front_layer_name!r}, {self._car_layer_name}, {self._tree_layer_name} '
-            f'(weight=0.0 — ingest-only; raise via set_layer_weight to feed combined score).'
+            f'ExploRFM ready. Layer registered: {self._front_layer_name!r} '
+            f'(weight=0.0 — ingest-only).'
         )
-
-        # Pre-compute SigLIP2 text embeddings for the object queries so we don't
-        # re-encode them on every image.  Shape: (Q, D), L2-normalized along D.
-        try:
-            with torch.inference_mode():
-                text_emb = self._explorfm.forward_on_text(self.object_queries)
-            self._object_text_emb = F.normalize(text_emb.float(), dim=-1).contiguous()
-            self.get_logger().info(
-                f'Object text embeddings cached for queries={self.object_queries} '
-                f'(shape={tuple(self._object_text_emb.shape)}, '
-                f'threshold={self._object_threshold:.3f}).'
-            )
-        except Exception as exc:
-            self.get_logger().error(
-                f'Failed to encode object queries {self.object_queries}: {exc}; '
-                'car/tree layers will stay empty.'
-            )
-            self._object_text_emb = None
 
     def _camera_info_cb(self, msg: CameraInfo) -> None:
         if self._cam_K is not None:
@@ -1628,12 +1558,10 @@ class OdinNavGraphNode(Node):
         if proj is None:
             return
 
-        # Per-node values produced by the model (same length/order as proj['visible_nodes']).
-        trav_per_node: Optional[np.ndarray] = None
         front_per_node: Optional[np.ndarray] = None
         if do_infer:
             try:
-                trav_per_node, front_per_node = self._infer_and_ingest(rgb, proj)
+                front_per_node = self._infer_and_ingest(rgb, proj)
             except Exception as exc:  # pragma: no cover  - defensive
                 import traceback
                 self.get_logger().error(
@@ -1644,7 +1572,7 @@ class OdinNavGraphNode(Node):
         if in_save_window:
             try:
                 self._save_frame_files(
-                    msg, rgb, proj, t_sec, trav_per_node, front_per_node,
+                    msg, rgb, proj, t_sec, front_per_node,
                 )
             except Exception as exc:
                 import traceback
@@ -1772,81 +1700,44 @@ class OdinNavGraphNode(Node):
         self,
         rgb: np.ndarray,
         proj: dict,
-    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        """Run ExploRFM, sample at projected pixels, ingest into layers.
+    ) -> Optional[np.ndarray]:
+        """Run ExploRFM frontier head, sample at projected frontier pixels, ingest scores.
 
-        Returns ``(trav_per_node, front_per_node)`` aligned with
-        ``proj['visible_nodes']``.  ``front_per_node`` is NaN for non-frontier
-        rows (they are not ingested into the frontier layer).
+        Returns ``front_per_node`` — float32 array (N,) with NaN for non-frontier nodes.
+        Returns None if no visible nodes.
         """
         ids_np = proj['visible_ids']
         if ids_np.size == 0:
-            return None, None
+            return None
 
         t0 = time.perf_counter()
-        trav_t, front_t, ad_feats_t = self._explorfm.forward_on_numpy(rgb)
-        # Both tensors are (1, 1, H, W) on cuda, sized to the input rgb.
-        trav_np = trav_t[0, 0].detach().float().cpu().numpy()
+        _trav_t, front_t, _ad_feats = self._explorfm.forward_on_numpy(rgb)
         front_np = front_t[0, 0].detach().float().cpu().numpy()
         infer_ms = (time.perf_counter() - t0) * 1000.0
 
-        h, w = trav_np.shape
+        h, w = front_np.shape
         u = np.clip(proj['visible_u'], 0, w - 1)
         v = np.clip(proj['visible_v'], 0, h - 1)
-        trav_vals = trav_np[v, u].astype(np.float32)
 
         types_np = proj['visible_types']
         front_mask = types_np == 2
         front_vals_full = np.full(ids_np.shape, np.nan, dtype=np.float32)
-        if front_mask.any():
-            front_vals_full[front_mask] = front_np[v[front_mask], u[front_mask]].astype(np.float32)
-
-        device = self.builder.global_builder._global_pos.device
-        ids_t = torch.from_numpy(ids_np).to(device=device, dtype=torch.long)
-        trav_vals_t = torch.from_numpy(trav_vals).to(device=device, dtype=torch.float32)
-        # Traversability layer disabled.
-        # self.builder.ingest_layer_scores(self._trav_layer_name, ids_t, trav_vals_t)
-
         n_front = int(front_mask.sum())
         if n_front > 0:
+            front_vals_full[front_mask] = front_np[v[front_mask], u[front_mask]].astype(np.float32)
+            device = self.builder.global_builder._global_pos.device
             front_ids_t = torch.from_numpy(ids_np[front_mask]).to(device=device, dtype=torch.long)
             front_vals_t = torch.from_numpy(front_vals_full[front_mask]).to(
                 device=device, dtype=torch.float32,
             )
             self.builder.ingest_layer_scores(self._front_layer_name, front_ids_t, front_vals_t)
 
-        # Per-node object detection (car / tree) via SigLIP2 text-patch similarity.
-        # Sampled at each visible node's pixel; binary 1 where cosine sim exceeds
-        # self._object_threshold, else 0.  Ingested into _car/_tree layer names.
-        obj_hits_log = ''
-        if self._object_text_emb is not None:
-            patch = F.normalize(ad_feats_t.float(), dim=1)                        # (1, D, h, w)
-            sim = torch.einsum('nd,bdhw->bnhw', self._object_text_emb, patch)     # (1, Q, h, w)
-            sim_full = F.interpolate(
-                sim, size=rgb.shape[:2], mode='bilinear', align_corners=False,
-            )[0]                                                                  # (Q, H, W)
-            sim_np = sim_full.detach().float().cpu().numpy()
-
-            ids_t_obj = torch.from_numpy(ids_np).to(device=device, dtype=torch.long)
-            counts: list[int] = []
-            for qi, layer_name in enumerate(self._object_layer_names):
-                vals_q = sim_np[qi, v, u]
-                labels_q = (vals_q > self._object_threshold).astype(np.float32)
-                labels_t = torch.from_numpy(labels_q).to(device=device, dtype=torch.float32)
-                self.builder.ingest_layer_scores(layer_name, ids_t_obj, labels_t)
-                counts.append(int(labels_q.sum()))
-            obj_hits_log = ' ' + ' '.join(
-                f'{q}={c}' for q, c in zip(self.object_queries, counts)
-            )
-
         self.get_logger().info(
             f'[explorfm rgb={self._rgb_count}] infer={infer_ms:.1f}ms '
             f'visible={ids_np.size} frontiers={n_front} '
-            f'trav[min={trav_np.min():.2f} max={trav_np.max():.2f}] '
             f'front[min={front_np.min():.2f} max={front_np.max():.2f}]'
-            f'{obj_hits_log}'
         )
-        return trav_vals, front_vals_full
+        return front_vals_full
 
     def _save_frame_files(
         self,
@@ -1854,7 +1745,6 @@ class OdinNavGraphNode(Node):
         rgb: np.ndarray,
         proj: dict,
         t_sec: float,
-        trav_per_node: Optional[np.ndarray],
         front_per_node: Optional[np.ndarray],
     ) -> None:
         """Write the four-file frame: rgb / nodes / edges / json."""
@@ -1863,11 +1753,7 @@ class OdinNavGraphNode(Node):
         K = self._cam_K
         cam_frame = self._cam_frame or (msg.header.frame_id or 'camera_optical')
 
-        # Augment visible_nodes with model values for verification in the JSON.
         visible_nodes = proj['visible_nodes']
-        if trav_per_node is not None:
-            for i, node in enumerate(visible_nodes):
-                node['traversability'] = float(trav_per_node[i])
         if front_per_node is not None:
             for i, node in enumerate(visible_nodes):
                 val = front_per_node[i]

@@ -2,7 +2,7 @@
 __pycache__/
 *.py[codz]
 *$py.class
-
+recorded_bags/
 # C extensions
 *.so
 
@@ -23,7 +23,7 @@ wheels/
 share/python-wheels/
 *.egg-info/
 .installed.cfg
-*.egg
+*.egg   
 MANIFEST
 
 # PyInstaller
