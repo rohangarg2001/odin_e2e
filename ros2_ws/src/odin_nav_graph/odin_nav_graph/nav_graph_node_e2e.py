@@ -406,7 +406,7 @@ class OdinNavGraphE2ENode(Node):
         t_img = stamp_to_sec(msg.header.stamp)
         odom = self._find_pose_at(t_img)
         if odom is None:
-            self.get_logger().warn(
+            self.get_logger().warning(
                 f'No odometry within {self.odom_match_max_dt}s of image '
                 f't={t_img:.3f} (buf size {len(self.odom_buf)})',
                 throttle_duration_sec=2.0,
@@ -522,7 +522,7 @@ class OdinNavGraphE2ENode(Node):
         silently dropped.  Each node is labelled with its forward depth x.
         """
         if self._cam_K is None:
-            self.get_logger().warn(
+            self.get_logger().warning(
                 'No camera intrinsics yet — set cam_fx/fy/cx/cy params or wait '
                 'for CameraInfo; skipping overlay.',
                 throttle_duration_sec=5.0,

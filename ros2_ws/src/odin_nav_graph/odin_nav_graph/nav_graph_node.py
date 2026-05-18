@@ -632,7 +632,7 @@ class OdinNavGraphNode(Node):
         self.declare_parameter('process_every_n', 1)
         self.declare_parameter('max_cloud_frames', 10000)   # 0 = unlimited; stop graph updates after N frames  #200 when starting from 200s
         self.declare_parameter('publish_elevation_cloud', True)
-        self.declare_parameter('publish_edges', True)
+        self.declare_parameter('publish_edges', False)
         self.declare_parameter('max_edges_published', 100000)
         # Safety: if the global graph blows up past this many nodes,
         # log a warning and reset.  Healthy operation should stay well
@@ -958,7 +958,7 @@ class OdinNavGraphNode(Node):
             return
 
         if msg.header.frame_id != self.robot_frame:
-            self.get_logger().warn(
+            self.get_logger().warning(
                 f'cloud frame_id={msg.header.frame_id!r} != expected '
                 f'{self.robot_frame!r}; transform may be wrong.',
                 throttle_duration_sec=5.0,
@@ -967,7 +967,7 @@ class OdinNavGraphNode(Node):
         t_cloud = stamp_to_sec(msg.header.stamp)
         odom = self._find_pose_at(t_cloud)
         if odom is None:
-            self.get_logger().warn(
+            self.get_logger().warning(
                 f'No odometry within {self.odom_match_max_dt}s of cloud t={t_cloud:.3f} '
                 f'(buf size {len(self.odom_buf)})',
                 throttle_duration_sec=2.0,
@@ -976,7 +976,7 @@ class OdinNavGraphNode(Node):
 
         if odom.header.frame_id and odom.header.frame_id != self.frame_id:
             # We assume odom is published in the configured world frame.  Just warn.
-            self.get_logger().warn(
+            self.get_logger().warning(
                 f'odom header frame_id={odom.header.frame_id!r} != '
                 f'{self.frame_id!r}; treating odom pose as world-frame anyway.',
                 throttle_duration_sec=10.0,
@@ -1021,7 +1021,7 @@ class OdinNavGraphNode(Node):
             xyz_base = xyz_base[r2 <= self.cloud_max_range ** 2]
 
         if xyz_base.shape[0] == 0:
-            self.get_logger().warn('Cloud has zero finite in-range points',
+            self.get_logger().warning('Cloud has zero finite in-range points',
                                    throttle_duration_sec=2.0)
             return
         t_parse = (time.perf_counter() - t0) * 1000.0
@@ -1489,7 +1489,7 @@ class OdinNavGraphNode(Node):
         if not self._cam_frame:
             self._cam_frame = msg.header.frame_id
         if self._cam_K is None:
-            self.get_logger().warn(
+            self.get_logger().warning(
                 'No camera intrinsics — set cam_fx/fy/cx/cy params or publish camera_info.',
                 throttle_duration_sec=10.0,
             )
@@ -1566,7 +1566,7 @@ class OdinNavGraphNode(Node):
         """
         odom_msg = self._find_pose_at(t_sec)
         if odom_msg is None:
-            self.get_logger().warn(
+            self.get_logger().warning(
                 f'No odometry near image t={t_sec:.3f} (buf={len(self.odom_buf)}); skipping.',
                 throttle_duration_sec=5.0,
             )
