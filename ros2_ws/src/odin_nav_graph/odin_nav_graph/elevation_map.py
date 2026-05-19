@@ -17,8 +17,10 @@ Two convention details that matter and are *easy to get wrong*:
        (cx + (W/2 - 1 - c) * res, cy + (H/2 - 1 - r) * res)
    — i.e. **rows index Y, cols index X** with row 0 = max-y (north)
    and col 0 = max-x (east).  This is the grid_map / image-with-y-up
-   orientation.  (Verified by inspecting ``_assign_z_from_elevation``
-   which reads through ``elevation_flipped = np.flipud(np.fliplr(grid))``.)
+   orientation.  (Confirmed by the ``elevation_map`` branch of
+   ``NavigationGraphBuilder.update``: it applies ``np.fliplr(np.flipud(grid))``
+   — rot180 — to reach the bottom-left-origin occupancy convention, and
+   samples per-node Z from ``np.fliplr(grid)``.)
 
 Going from (1) to (2) is ``np.flipud(np.fliplr(elev.T))`` — first
 transpose to swap the row/col-axis meanings, then rot180 to put NE
@@ -94,6 +96,7 @@ class ElevationMapWrapper:
         sensor_noise_factor: float = 0.05,
         max_height_range: float = 1.5,
         recordable_fps: float = 0.0,
+        z_clip_threshold: float = 0.0,
     ):
         from elevation_mapping_cupy import ElevationMap, Parameter
 
@@ -123,6 +126,13 @@ class ElevationMapWrapper:
         self._param = param
         self.resolution = float(resolution)
         self.map_length = float(map_length)
+
+        # z-clip filter: cells whose absolute height differs from the
+        # reference z (the robot's current odom z, set via set_reference_z)
+        # by more than this many metres are dropped to NaN.  0 disables it.
+        # Catches ceilings/roofs that the lidar sweeps into the map.
+        self.z_clip_threshold = float(z_clip_threshold)
+        self._ref_z = 0.0
 
     # ──────────────────────────────────────────────────────────────────
     def move_to(self, position_xyz: np.ndarray, rotation_3x3: Optional[np.ndarray] = None) -> None:
@@ -167,6 +177,13 @@ class ElevationMapWrapper:
         self._map.update_variance()
         self._map.update_time()
 
+    def set_reference_z(self, z: float) -> None:
+        """Set the reference height used by the z-clip filter.
+
+        Pass the robot's current z in odom.  Call once per frame before
+        reading the elevation back out."""
+        self._ref_z = float(z)
+
     # ──────────────────────────────────────────────────────────────────
     def get_elevation_emcupy(self) -> np.ndarray:
         """Return the elevation in elevation_mapping_cupy's *native* layout:
@@ -176,7 +193,15 @@ class ElevationMapWrapper:
         is_valid = self._map.get_layer("is_valid").get()
         elevation = np.asarray(elevation, dtype=np.float32).copy()
         elevation[is_valid == 0] = np.nan
-        return elevation[1:-1, 1:-1]
+        elevation = elevation[1:-1, 1:-1]
+        if self.z_clip_threshold > 0.0:
+            # Drop cells whose absolute height is more than the threshold
+            # away from the robot's current z (e.g. roofs/ceilings).  The
+            # elevation layer stores world-frame z, so this compares
+            # against self._ref_z directly.
+            too_far = np.abs(elevation - self._ref_z) > self.z_clip_threshold
+            elevation[too_far] = np.nan
+        return elevation
 
     def get_elevation_for_navgraph(self) -> np.ndarray:
         """Return the elevation in nav_graph's expected convention

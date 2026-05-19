@@ -29,7 +29,6 @@ import math
 import os
 import sys
 import time
-import types
 from collections import deque
 from contextlib import suppress
 from typing import Optional, Tuple
@@ -159,178 +158,28 @@ def stamp_to_sec(stamp) -> float:
 # ─────────────────────────────────────────────────────────────────────
 #  Builder patches
 #
-#  When ``input_type='elevation_map'`` is used with a *rolling* local
-#  elevation window (as we do with elevation_mapping_cupy), nav_graph
-#  has two latent issues that combine to break the global graph:
+#  Two wrappers for real-world (vs. sim) robustness.  Both are
+#  independent of elevation-Z handling — nav_graph now does that
+#  correctly in-core: the waypoint generator stamps per-node Z from the
+#  elevation map at graph-generation time, so local and global Z agree
+#  and the 3D merge works without help.
 #
-#    A. ``GlobalGraphGenerator.tensor_merge_local_nodes_gpu`` does
-#       ``torch.cdist(local_worlds, global_worlds)`` over **3D** XYZ.
-#       The waypoint generator emits local nodes at Z=0 always, but
-#       ``_assign_z_from_elevation`` overwrites the *global* Z with
-#       elevation values.  Next frame, fresh local Z=0 nodes meet
-#       global Z=elevation nodes → 3D distance ≈ |Z| > merge_distance,
-#       merge fails, duplicate spawns at Z=0.  Stack frames and you get
-#       a tower at every (x, y).
-#
-#    B. ``_assign_z_from_elevation`` calls ``np.clip(px, 0, W-1)`` on
-#       every global node — even those far outside the current local
-#       window.  Their Z is then read off the edge of the elevation
-#       array (often NaN border cells), corrupting persistent state.
-#
-#  We patch both:
-#    - merge in 2D (XY only) so Z mismatch can't break it,
-#    - assign Z only to nodes actually inside the current window
-#      *and* whose elevation is finite — out-of-window nodes keep their
-#      previously-stored Z forever.
+#    - _make_traversability_smoother: majority-vote median filter on the
+#      categorical traversability map, killing speckle.
+#    - _make_ext_map_fixup: lets confirmed observations clear cells a
+#      noisy scan marked stuck-occupied in the extended map.
 #
 #  The patches operate on builder instances so we don't have to touch
 #  the nav_graph submodule.  Keep them in sync with the upstream
 #  ``GlobalGraphGenerator`` invariants documented in nav_graph's
 #  CLAUDE.md (parallel-array invariant, ID-vs-index discipline).
+#
+#  Removed 2026-05: the 2D-merge and in-bounds-Z patches (the latter
+#  overrode ``_assign_z_from_elevation``, which no longer exists).  The
+#  per-node-Z min-filter moved into nav_graph's WaypointGraphGeneratorConfig
+#  as ``elevation_min_filter_radius`` — fed below by the
+#  ``z_lookup_min_filter_radius_cells`` ROS param.
 # ─────────────────────────────────────────────────────────────────────
-
-def _patched_merge_2d(
-    self_gg,
-    local_worlds: torch.Tensor,
-    local_types: torch.Tensor,
-    global_worlds: torch.Tensor,
-    global_ids_tensor: torch.Tensor,
-    next_node_id: int,
-    merge_distance: float,
-    device: str = 'cuda',
-):
-    """2D-only replacement for ``GlobalGraphGenerator.tensor_merge_local_nodes_gpu``.
-
-    Identical to the upstream implementation, except the cdist for
-    matching local→global is over (x, y) not (x, y, z).  The full local
-    XYZ position is still stored when a new node is added, so per-node
-    Z (set later by the patched ``_assign_z_from_elevation``) survives.
-    """
-    N = local_worlds.shape[0]
-    if N == 0:
-        return (
-            torch.empty((0,), dtype=torch.long, device=device),
-            torch.empty((0, 3), dtype=torch.float32, device=device),
-            next_node_id,
-        )
-
-    if global_worlds.numel() == 0:
-        new_ids = torch.arange(
-            next_node_id, next_node_id + N, device=device, dtype=torch.long
-        )
-        final_ids = new_ids
-        new_local_mask = torch.ones(N, dtype=torch.bool, device=device)
-        updated_next_id = next_node_id + N
-        local_id_positions = local_worlds
-    else:
-        # The only line that differs from upstream: 2D cdist.
-        dists = torch.cdist(local_worlds[:, :2], global_worlds[:, :2])
-        min_dists, min_idx = torch.min(dists, dim=1)
-
-        merge_mask = min_dists < merge_distance
-        merged_ids = global_ids_tensor[min_idx]
-
-        new_local_mask = ~merge_mask
-        num_new = int(new_local_mask.sum().item())
-        new_ids = torch.arange(
-            next_node_id, next_node_id + num_new, device=device, dtype=torch.long
-        )
-
-        final_ids = merged_ids.clone()
-        final_ids[new_local_mask] = new_ids
-        updated_next_id = next_node_id + num_new
-
-        # Merged nodes snap to the existing global position (preserves
-        # the persistent Z that out-of-window nodes still carry).
-        local_id_positions = local_worlds.clone()
-        local_id_positions[~new_local_mask] = global_worlds[min_idx[~new_local_mask]]
-
-        if merge_mask.any():
-            self_gg._global_node_types[min_idx[merge_mask]] = local_types[merge_mask]
-
-    if new_local_mask.any():
-        self_gg._global_pos = torch.cat(
-            [self_gg._global_pos, local_worlds[new_local_mask]], dim=0
-        )
-        self_gg._global_ids = torch.cat([self_gg._global_ids, new_ids], dim=0)
-        self_gg._global_node_types = torch.cat(
-            [self_gg._global_node_types, local_types[new_local_mask]], dim=0
-        )
-
-    return final_ids, local_id_positions, updated_next_id
-
-
-def _patched_assign_z_inbounds(
-    self_builder,
-    elevation_flipped: np.ndarray,
-    origin_x: float,
-    origin_y: float,
-    resolution: float,
-    width: int,
-    height: int,
-):
-    """Replacement for ``NavigationGraphBuilder._assign_z_from_elevation``.
-
-    Updates Z **only** for nodes that fall inside the current local
-    elevation window and have a finite elevation reading.  Out-of-window
-    nodes keep their stored Z forever, so once the robot drives past a
-    region the height info there persists in the global graph.
-
-    Z is sampled from a NaN-aware **min-filtered** copy of the elevation
-    grid.  Without this, frontier nodes at the perimeter of the local
-    map pick up grazing-angle / single-beam noise — the LiDAR's far
-    range hits objects at flat angles, biasing the per-cell Z way above
-    the actual floor — and end up sitting suspiciously high.  Taking
-    the min over a small (configurable) neighbourhood snaps each node
-    to the lowest plausible surface in that neighbourhood, which is
-    almost always the floor for traversable cells.
-
-    Window size comes from the optional builder attribute
-    ``_z_lookup_min_filter_radius_cells`` (radius in cells; full kernel
-    is ``2*r + 1``).  Default 2 → 5×5 cells.  Set to 0 to disable.
-    """
-    gg = self_builder.global_builder
-    if gg._global_pos.shape[0] == 0:
-        return
-
-    radius = int(getattr(self_builder, '_z_lookup_min_filter_radius_cells', 2))
-    if radius > 0:
-        from scipy.ndimage import minimum_filter
-        finite = np.isfinite(elevation_flipped)
-        if not finite.any():
-            return
-        # Replace NaN with +inf so unobserved cells lose the min comparison.
-        ef = np.where(finite, elevation_flipped, np.inf).astype(np.float32, copy=False)
-        ef = minimum_filter(ef, size=2 * radius + 1, mode='nearest')
-        # Cells whose entire neighbourhood was NaN remain +inf — restore NaN.
-        elevation_for_lookup = np.where(np.isfinite(ef), ef, np.nan)
-    else:
-        elevation_for_lookup = elevation_flipped
-
-    xy_cpu = gg._global_pos[:, :2].cpu().numpy()
-    px = np.rint((xy_cpu[:, 0] - origin_x) / resolution + width / 2.0).astype(np.int64)
-    py = np.rint((xy_cpu[:, 1] - origin_y) / resolution + height / 2.0).astype(np.int64)
-
-    in_bounds = (px >= 0) & (px < width) & (py >= 0) & (py < height)
-    if not in_bounds.any():
-        return
-
-    px_in = px[in_bounds]
-    py_in = py[in_bounds]
-    z_vals = elevation_for_lookup[py_in, px_in]
-    valid = np.isfinite(z_vals)
-    if not valid.any():
-        return
-
-    # Indices of global nodes whose Z we're updating this frame.
-    update_idx = np.where(in_bounds)[0][valid]
-    z_new = z_vals[valid].astype(np.float32)
-
-    device = gg._global_pos.device
-    idx_t = torch.from_numpy(update_idx).to(device=device, dtype=torch.long)
-    z_t = torch.from_numpy(z_new).to(device=device, dtype=torch.float32)
-    gg._global_pos[idx_t, 2] = z_t
-
 
 def _make_traversability_smoother(builder, median_size: int):
     """Wrap ``_compute_traversability`` with a post-pass median-filter smoother.
@@ -418,10 +267,8 @@ def _make_ext_map_fixup(gg, original_fn):
 
 
 def _install_builder_patches(builder) -> None:
-    """Install all patches on a ``NavigationGraphBuilder`` instance."""
+    """Install instance-level patches on a ``NavigationGraphBuilder``."""
     gg = builder.global_builder
-    gg.tensor_merge_local_nodes_gpu = types.MethodType(_patched_merge_2d, gg)
-    builder._assign_z_from_elevation = types.MethodType(_patched_assign_z_inbounds, builder)
     # Wrap _update_extended_map so confirmed observations can clear stuck-occupied cells.
     gg._update_extended_map = _make_ext_map_fixup(gg, gg._update_extended_map)
 
@@ -592,6 +439,10 @@ class OdinNavGraphNode(Node):
         self.declare_parameter('map_resolution', 0.10)
         self.declare_parameter('cloud_max_range', 8.0)
         self.declare_parameter('sensor_noise_factor', 0.05)
+        # Drop elevation cells whose absolute height differs from the robot's
+        # current odom z by more than this many metres (catches roofs/ceilings
+        # the lidar sweeps in).  0 disables the filter.
+        self.declare_parameter('elevation_z_clip', 1.0)
         self.declare_parameter('em_position_noise', 0.0)
         self.declare_parameter('em_orientation_noise', 0.0)
 
@@ -636,6 +487,12 @@ class OdinNavGraphNode(Node):
         self.declare_parameter('process_every_n', 1)
         self.declare_parameter('max_cloud_frames', 10000)   # 0 = unlimited; stop graph updates after N frames  #200 when starting from 200s
         self.declare_parameter('publish_elevation_cloud', True)
+        # 2D top-down heatmap of the local elevation map (nav_msgs/OccupancyGrid).
+        # Heights in [z_min, z_max] are linearly quantised to 0..100; cells
+        # outside the range are clamped; unknown cells become -1.
+        self.declare_parameter('publish_elevation_grid', True)
+        self.declare_parameter('elevation_grid_z_min', -1.0)
+        self.declare_parameter('elevation_grid_z_max', 3.0)
         self.declare_parameter('publish_edges', True)
         self.declare_parameter('max_edges_published', 100000)
         # Safety: if the global graph blows up past this many nodes,
@@ -732,6 +589,9 @@ class OdinNavGraphNode(Node):
         self.process_every_n = int(gp('process_every_n'))
         self.max_cloud_frames = int(gp('max_cloud_frames'))
         self.publish_elevation_cloud = bool(gp('publish_elevation_cloud'))
+        self.publish_elevation_grid = bool(gp('publish_elevation_grid'))
+        self.elevation_grid_z_min = float(gp('elevation_grid_z_min'))
+        self.elevation_grid_z_max = float(gp('elevation_grid_z_max'))
         self.publish_edges_flag = bool(gp('publish_edges'))
         self.max_graph_nodes_before_reset = int(gp('max_graph_nodes_before_reset'))
         self._z_lookup_min_filter_radius_cells = int(gp('z_lookup_min_filter_radius_cells'))
@@ -748,6 +608,7 @@ class OdinNavGraphNode(Node):
             global_max_candidate_edge_distance=float(gp('global_max_candidate_edge_distance')),
             global_max_candidate_edge_search_distance = 100,
             global_max_connections = 12,
+            elevation_min_filter_radius=self._z_lookup_min_filter_radius_cells,
             frontier=FrontierConfig(
                 kernel_size=int(gp('frontier_kernel_size')),
                 odom_proximity_threshold=float(gp('frontier_odom_threshold')),
@@ -769,21 +630,14 @@ class OdinNavGraphNode(Node):
 
         self.get_logger().info('Initialising NavigationGraphBuilder (GPU)...')
         self.builder = NavigationGraphBuilder(cfg)
-        # Patch the builder for rolling-elevation use:
-        #   - 2D-only merge so Z mismatch can't break it
-        #   - in-bounds-only, min-filtered Z assignment so out-of-window
-        #     nodes keep their stored elevation forever and boundary
-        #     nodes don't pick up grazing-angle / wall-top noise.
-        self.builder._z_lookup_min_filter_radius_cells = (
-            self._z_lookup_min_filter_radius_cells
-        )
+        # Real-world robustness wrappers (per-node Z is handled in-core now).
         _install_builder_patches(self.builder)
         trav_median_size = int(gp('trav_median_filter_size'))
         _make_traversability_smoother(self.builder, trav_median_size)
         self.get_logger().info(
             f'NavigationGraphBuilder ready '
-            f'(2D-merge + in-bounds Z + ext-map fixup + '
-            f'trav-smoother size={trav_median_size} patches installed).'
+            f'(ext-map fixup + trav-smoother size={trav_median_size} '
+            f'patches installed).'
         )
 
         # Visited-time layer: increments the closest-to-robot node by 1 each
@@ -820,6 +674,7 @@ class OdinNavGraphNode(Node):
             map_length=length_xy,
             resolution=res,
             sensor_noise_factor=sensor_noise_factor,
+            z_clip_threshold=float(gp('elevation_z_clip')),
         )
         self.get_logger().info(
             f'ElevationMap ready (cell_n={self.emap._param.cell_n}, '
@@ -839,6 +694,8 @@ class OdinNavGraphNode(Node):
 
         # ── Publishers ────────────────────────────────────────────────
         self.elev_pub = self.create_publisher(PointCloud2, '~/elevation_cloud', 1)
+        # 2D heatmap of the local elevation map; view with an RViz Map display.
+        self.elev_grid_pub = self.create_publisher(OccupancyGrid, '~/elevation_grid', 1)
         self.graph_pub = self.create_publisher(PointCloud2, '~/graph_nodes', 1)
         self.frontier_pub = self.create_publisher(PointCloud2, '~/frontier_cloud', 1)
         # Raw (pre-clustering) frontier cells straight from FrontierDetector.
@@ -966,7 +823,7 @@ class OdinNavGraphNode(Node):
             return
 
         if msg.header.frame_id != self.robot_frame:
-            self.get_logger().warn(
+            self.get_logger().warning(
                 f'cloud frame_id={msg.header.frame_id!r} != expected '
                 f'{self.robot_frame!r}; transform may be wrong.',
                 throttle_duration_sec=5.0,
@@ -975,7 +832,7 @@ class OdinNavGraphNode(Node):
         t_cloud = stamp_to_sec(msg.header.stamp)
         odom = self._find_pose_at(t_cloud)
         if odom is None:
-            self.get_logger().warn(
+            self.get_logger().warning(
                 f'No odometry within {self.odom_match_max_dt}s of cloud t={t_cloud:.3f} '
                 f'(buf size {len(self.odom_buf)})',
                 throttle_duration_sec=2.0,
@@ -984,7 +841,7 @@ class OdinNavGraphNode(Node):
 
         if odom.header.frame_id and odom.header.frame_id != self.frame_id:
             # We assume odom is published in the configured world frame.  Just warn.
-            self.get_logger().warn(
+            self.get_logger().warning(
                 f'odom header frame_id={odom.header.frame_id!r} != '
                 f'{self.frame_id!r}; treating odom pose as world-frame anyway.',
                 throttle_duration_sec=10.0,
@@ -1029,7 +886,7 @@ class OdinNavGraphNode(Node):
             xyz_base = xyz_base[r2 <= self.cloud_max_range ** 2]
 
         if xyz_base.shape[0] == 0:
-            self.get_logger().warn('Cloud has zero finite in-range points',
+            self.get_logger().warning('Cloud has zero finite in-range points',
                                    throttle_duration_sec=2.0)
             return
         t_parse = (time.perf_counter() - t0) * 1000.0
@@ -1042,6 +899,8 @@ class OdinNavGraphNode(Node):
         #    transforms the points internally.
         t0 = time.perf_counter()
         self.emap.move_to(np.array([trans[0], trans[1], 0.0], dtype=np.float32))
+        # Reference height for the z-clip filter — the robot's current odom z.
+        self.emap.set_reference_z(float(trans[2]))
         self.emap.integrate(
             xyz_base,
             t_sensor_in_odom=trans,
@@ -1122,9 +981,6 @@ class OdinNavGraphNode(Node):
                 'resetting builder. Investigate convention/merge issues before re-running.'
             )
             self.builder.reset()
-            self.builder._z_lookup_min_filter_radius_cells = (
-                self._z_lookup_min_filter_radius_cells
-            )
             _install_builder_patches(self.builder)
             _make_traversability_smoother(
                 self.builder,
@@ -1135,6 +991,8 @@ class OdinNavGraphNode(Node):
         stamp = msg.header.stamp
         if self.publish_elevation_cloud:
             self._publish_elevation_cloud(stamp)
+        if self.publish_elevation_grid:
+            self._publish_elevation_grid(stamp)
         self._publish_graph_nodes(result, stamp)
         self._publish_frontier_cloud(result, stamp)
         self._publish_raw_frontiers(result, stamp)
@@ -1190,6 +1048,58 @@ class OdinNavGraphNode(Node):
         zs = elev[rs, cs].astype(np.float32)
         pts = np.stack([xs.astype(np.float32), ys.astype(np.float32), zs], axis=1)
         self.elev_pub.publish(self._make_xyz_intensity_cloud(pts, zs, stamp))
+
+    def _publish_elevation_grid(self, stamp) -> None:
+        """Publish the local elevation map as a 2D OccupancyGrid heatmap.
+
+        Heights are linearly quantised: ``elevation_grid_z_min`` -> 0,
+        ``elevation_grid_z_max`` -> 100 (clamped); unknown cells -> -1.
+        View in RViz with a Map display — Color Scheme 'costmap' renders a
+        blue->red heatmap, so cells on a roof show up as red outliers.
+        """
+        elev = self.emap.get_elevation_emcupy()  # elev[r, c]: r->x, c->y
+        valid = np.isfinite(elev)
+        if not valid.any():
+            return
+        H, W = elev.shape
+        cx, cy = self.emap.center_xy()
+        res = self.emap.resolution
+
+        z_min = self.elevation_grid_z_min
+        z_max = self.elevation_grid_z_max
+        span = max(z_max - z_min, 1e-6)
+        norm = (elev - z_min) / span * 100.0
+        data = np.full((H, W), -1, dtype=np.int8)
+        data[valid] = np.clip(norm[valid], 0.0, 100.0).astype(np.int8)
+
+        # OccupancyGrid layout: data[row*width + col], col along +x, row
+        # along +y.  elev rows index x and cols index y, so width=H (x),
+        # height=W (y), and the ROS grid is elev transposed.
+        ros_data = np.ascontiguousarray(data.T)
+
+        msg = OccupancyGrid()
+        msg.header = Header(stamp=stamp, frame_id=self.frame_id)
+        msg.info = MapMetaData()
+        msg.info.resolution = float(res)
+        msg.info.width = int(H)
+        msg.info.height = int(W)
+        msg.info.origin = Pose()
+        msg.info.origin.position.x = float(cx - H * res / 2.0)
+        msg.info.origin.position.y = float(cy - W * res / 2.0)
+        msg.info.origin.position.z = 0.0
+        msg.info.origin.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
+        msg.data = ros_data.flatten().tolist()
+        self.elev_grid_pub.publish(msg)
+
+        # Log raw height stats so the actual elevation values are visible
+        # in the console and the colour range can be tuned accordingly.
+        vz = elev[valid]
+        self.get_logger().info(
+            f'elevation_grid: valid={vz.size} '
+            f'z[min/med/max]={vz.min():.2f}/{np.median(vz):.2f}/{vz.max():.2f} '
+            f'colour_range=[{z_min:.2f},{z_max:.2f}]',
+            throttle_duration_sec=2.0,
+        )
 
     def _publish_graph_nodes(self, result, stamp) -> None:
         if result.num_nodes == 0:
@@ -1516,7 +1426,7 @@ class OdinNavGraphNode(Node):
         if not self._cam_frame:
             self._cam_frame = msg.header.frame_id
         if self._cam_K is None:
-            self.get_logger().warn(
+            self.get_logger().warning(
                 'No camera intrinsics — set cam_fx/fy/cx/cy params or publish camera_info.',
                 throttle_duration_sec=10.0,
             )
@@ -1593,7 +1503,7 @@ class OdinNavGraphNode(Node):
         """
         odom_msg = self._find_pose_at(t_sec)
         if odom_msg is None:
-            self.get_logger().warn(
+            self.get_logger().warning(
                 f'No odometry near image t={t_sec:.3f} (buf={len(self.odom_buf)}); skipping.',
                 throttle_duration_sec=5.0,
             )
