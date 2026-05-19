@@ -604,17 +604,21 @@ class OdinNavGraphNode(Node):
         self.declare_parameter('merge_node_distance', 0.5)
         self.declare_parameter('global_merge_distance', 0.5)
         self.declare_parameter('global_max_candidate_edge_distance', 1.2)
-        self.declare_parameter('free_space_sampling_threshold', 0.5)
+        self.declare_parameter('free_space_sampling_threshold', 0.35)
 
         self.declare_parameter('frontier_kernel_size', 5)
         self.declare_parameter('frontier_odom_threshold', 1.0)
         self.declare_parameter('frontier_max_edge_connectivity', 14)
         self.declare_parameter('minimum_distance_between_frontiers', 0.05)
         self.declare_parameter('minimum_points_in_cluster', 1)
+        # Fraction of the neighbourhood window (relative to its area) that must
+        # be free / unknown for a cell to qualify as a frontier.
+        self.declare_parameter('frontier_min_free_fraction', 0.15)
+        self.declare_parameter('frontier_min_unknown_fraction', 0.05)
 
         # Elevation -> traversability params
-        self.declare_parameter('elev_max_height_diff', 0.3)
-        self.declare_parameter('elev_max_slope', 0.5)
+        self.declare_parameter('elev_max_height_diff', 0.5)
+        self.declare_parameter('elev_max_slope', 1.0)
         self.declare_parameter('elev_gaussian_sigma', 0.5)
         self.declare_parameter('elev_window_size', 5)
         self.declare_parameter('elev_border_cells', 0)
@@ -750,6 +754,8 @@ class OdinNavGraphNode(Node):
                 max_edge_connectivity=int(gp('frontier_max_edge_connectivity')),
                 minimum_distance_between_frontiers=float(gp('minimum_distance_between_frontiers')),
                 minimum_points_in_cluster=int(gp('minimum_points_in_cluster')),
+                min_free_fraction=float(gp('frontier_min_free_fraction')),
+                min_unknown_fraction=float(gp('frontier_min_unknown_fraction')),
                 angular_gap_min_gap_deg = 120.0,
             ),
             elevation_map=ElevationMapConfig(
@@ -835,6 +841,8 @@ class OdinNavGraphNode(Node):
         self.elev_pub = self.create_publisher(PointCloud2, '~/elevation_cloud', 1)
         self.graph_pub = self.create_publisher(PointCloud2, '~/graph_nodes', 1)
         self.frontier_pub = self.create_publisher(PointCloud2, '~/frontier_cloud', 1)
+        # Raw (pre-clustering) frontier cells straight from FrontierDetector.
+        self.raw_frontier_pub = self.create_publisher(PointCloud2, '~/raw_frontiers', 1)
         self.edges_pub = self.create_publisher(Marker, '~/graph_edges', 1)
         # Layer visualisation clouds — intensity in [0,1], colour with RViz intensity colormap.
         #   ~/frontier_score_cloud  — frontier nodes, ExploRFM frontier score.
@@ -1129,6 +1137,7 @@ class OdinNavGraphNode(Node):
             self._publish_elevation_cloud(stamp)
         self._publish_graph_nodes(result, stamp)
         self._publish_frontier_cloud(result, stamp)
+        self._publish_raw_frontiers(result, stamp)
         if self.publish_edges_flag:
             self._publish_edges(result, stamp)
         self._publish_score_clouds(result, stamp)
@@ -1207,6 +1216,24 @@ class OdinNavGraphNode(Node):
         # Flat colour — constant intensity so RViz renders one solid colour.
         flat = np.ones(positions.shape[0], dtype=np.float32)
         self.frontier_pub.publish(self._make_xyz_intensity_cloud(positions, flat, stamp))
+
+    def _publish_raw_frontiers(self, result, stamp) -> None:
+        """Publish raw (pre-clustering) frontier cells from FrontierDetector.
+
+        ``result.frontiers`` is an (F, 2) CPU tensor of world [x, y] cell
+        centres.  The detector emits no Z, so cells are placed at the
+        ``viz_z_offset`` height to sit clearly above the elevation cloud.
+        """
+        raw = result.frontiers
+        if raw is None or raw.shape[0] == 0:
+            return
+        xy = raw.detach().cpu().numpy().astype(np.float32)
+        n = xy.shape[0]
+        pts = np.empty((n, 3), dtype=np.float32)
+        pts[:, :2] = xy
+        pts[:, 2] = self.viz_z_offset
+        flat = np.ones(n, dtype=np.float32)
+        self.raw_frontier_pub.publish(self._make_xyz_intensity_cloud(pts, flat, stamp))
 
     def _publish_edges(self, result, stamp) -> None:
         if result.num_nodes == 0 or result.num_edges == 0:
