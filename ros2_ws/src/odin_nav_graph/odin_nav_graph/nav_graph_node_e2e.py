@@ -37,12 +37,14 @@ import cv2
 import numpy as np
 import rclpy
 import torch
+import torch.nn.functional as F
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 
 from sensor_msgs.msg import PointCloud2, PointField, Image, CameraInfo
 from nav_msgs.msg import Odometry
-from std_msgs.msg import Header
+from std_msgs.msg import Header, Empty
+from geometry_msgs.msg import Point
 from visualization_msgs.msg import Marker, MarkerArray
 from scipy.spatial.transform import Rotation as _ScipyR
 
@@ -92,6 +94,13 @@ class OdinNavGraphE2ENode(Node):
         self.declare_parameter('odom_topic', '/odin1/odometry_highfreq')
         self.declare_parameter('frame_id', 'odom')
 
+        # Which model to run:
+        #   'detr'    -> NavGraphDETR (per-query objectness + 3-D regression)
+        #   'heatmap' -> HeatmapNavModel (dense traversability heatmap +
+        #                Poisson-disk sampling + per-pixel 3-D map)
+        self.declare_parameter('model_type', 'detr')
+
+        # DETR model location.
         self.declare_parameter(
             'model_checkpoint',
             '/home/rohang73/ASL/e2e_rgb_nav_graph/four_longrange_size280_overfit/epoch_999.pth',
@@ -99,14 +108,36 @@ class OdinNavGraphE2ENode(Node):
         self.declare_parameter(
             'e2e_repo_path', '/home/rohang73/ASL/e2e_rgb_nav_graph',
         )
+
+        # Heatmap model location.
+        self.declare_parameter(
+            'heatmap_checkpoint',
+            '/home/rohang73/ASL/e2e_rgb_nav_graph/heatmap_model_training_v5_wall_neg_more_vitb518/best.pth',
+        )
+        self.declare_parameter(
+            'heatmap_repo_path',
+            '/home/rohang73/ASL/e2e_rgb_nav_graph/heatmap_model',
+        )
+        # Heatmap-mode inference knobs.  -1 => take from checkpoint args.
+        self.declare_parameter('heatmap_sample_threshold', 0.5)
+        self.declare_parameter('heatmap_sample_min_dist', -1.0)
+        self.declare_parameter('heatmap_sample_window', -1)
+
         # 0.0 => take image_size / crop_top_frac from the checkpoint args.
         self.declare_parameter('image_size', 0)
         self.declare_parameter('crop_top_frac', -1.0)
-        self.declare_parameter('score_threshold', 0.7)
+        # DETR objectness threshold; unused in heatmap mode (it uses
+        # heatmap_sample_threshold instead).
+        self.declare_parameter('score_threshold', 0.97)
 
         # A local node within this distance (m, XYZ) of an existing global
         # node is treated as the same node and dropped.
         self.declare_parameter('merge_node_distance', 0.5)
+
+        # Visualisation-only z offset (m) added to every published node so
+        # they sit clearly above the floor in RViz.  Stored global node
+        # positions are unchanged — this only affects PointCloud2 + markers.
+        self.declare_parameter('viz_z_offset', 0.4)
 
         # Forward-range gate: drop model predictions farther than this many
         # metres ahead (model camera x = forward depth).  The monocular RGB
@@ -114,6 +145,38 @@ class OdinNavGraphE2ENode(Node):
         # walls and beyond dead ends; this clips them before they reach the
         # graph.  0.0 disables the gate.
         self.declare_parameter('max_node_range', 6.0)
+
+        # ── Edges (heatmap mode only) ────────────────────────────────
+        # Edges are built per-frame from this frame's local nodes:
+        #   1. take every pair within max_edge_distance (3-D),
+        #   2. sample the line in camera frame, project to the heatmap,
+        #   3. keep if min(heatmap_prob) >= edge_traversability_threshold,
+        #   4. add (sorted) global-ID pair to a write-once global set,
+        #      respecting max_edges_per_node on each endpoint.
+        # DETR mode has no heatmap, so it builds no edges.
+        self.declare_parameter('max_edge_distance', 1.5)
+        self.declare_parameter('edge_traversability_threshold', 0.6)
+        self.declare_parameter('edge_line_samples', 10)
+        self.declare_parameter('max_edges_per_node', 8)
+
+        # ── Graph pruning: drop nodes that ended up with zero edges ──
+        # Three independent triggers, each off by default:
+        #   prune_isolated_nodes  -> periodic, every prune_every_n_frames
+        #   prune_on_shutdown     -> one final pass before destroy_node
+        #   manual trigger topic  -> always-on; publish std_msgs/Empty to fire
+        self.declare_parameter('prune_isolated_nodes', False)
+        self.declare_parameter('prune_every_n_frames', 200)
+        self.declare_parameter('prune_on_shutdown', False)
+        self.declare_parameter('prune_trigger_topic', '~/prune_now')
+        # Edge passes if at least this fraction of the line's *in-bounds*
+        # samples clear edge_traversability_threshold.  Out-of-heatmap
+        # samples are dropped from the count entirely (don't vote either
+        # way).  Lower => more lenient; 1.0 == old strict-min behaviour.
+        self.declare_parameter('edge_line_min_pass_fraction', 0.85)
+        # An edge also needs at least this many in-bounds samples to be
+        # considered — protects against accepting an edge from a single
+        # marginal sample when most of the line is off-heatmap.
+        self.declare_parameter('edge_line_min_in_bounds', 3)
 
         # Time sync between image and odometry.
         self.declare_parameter('odom_buffer_seconds', 2.0)
@@ -137,6 +200,8 @@ class OdinNavGraphE2ENode(Node):
         # Margin (px) added around the image in the overlay so nodes that
         # project outside the image (wide / far predictions) stay visible.
         self.declare_parameter('debug_overlay_pad', 500)
+        # Master switch — set to true to start saving overlay PNGs.
+        self.declare_parameter('save_overlay', False)
 
         # Static camera(optical)->base_link extrinsic (Odin Nav Stack defaults).
         self.declare_parameter('cam_base_tx', -0.0042)
@@ -154,11 +219,22 @@ class OdinNavGraphE2ENode(Node):
         self.score_threshold = float(gp('score_threshold'))
         self.merge_node_distance = float(gp('merge_node_distance'))
         self.max_node_range = float(gp('max_node_range'))
+        self.viz_z_offset = float(gp('viz_z_offset'))
+        self.max_edge_distance = float(gp('max_edge_distance'))
+        self.edge_traversability_threshold = float(gp('edge_traversability_threshold'))
+        self.edge_line_samples = max(2, int(gp('edge_line_samples')))
+        self.max_edges_per_node = max(0, int(gp('max_edges_per_node')))
+        self.edge_line_min_pass_fraction = float(gp('edge_line_min_pass_fraction'))
+        self.edge_line_min_in_bounds = max(1, int(gp('edge_line_min_in_bounds')))
+        self._prune_enabled = bool(gp('prune_isolated_nodes'))
+        self._prune_every_n = max(1, int(gp('prune_every_n_frames')))
+        self.prune_on_shutdown = bool(gp('prune_on_shutdown'))
         self.odom_buffer_seconds = float(gp('odom_buffer_seconds'))
         self.odom_match_max_dt = float(gp('odom_match_max_dt'))
         self.process_every_n = max(1, int(gp('process_every_n')))
         self._debug_every_n = max(1, int(gp('debug_overlay_every_n')))
         self._overlay_pad = max(0, int(gp('debug_overlay_pad')))
+        self._save_overlay_enabled = bool(gp('save_overlay'))
 
         # ── Static camera extrinsic: T_base_from_optical ──────────────
         t_bc = np.array(
@@ -175,11 +251,24 @@ class OdinNavGraphE2ENode(Node):
             f'T_base_from_opt: t={t_bc.tolist()} q={q_bc.tolist()}'
         )
 
-        # ── Load the e2e model ────────────────────────────────────────
+        # ── Load the e2e model (DETR or heatmap) ──────────────────────
         self._device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        ckpt_path = str(gp('model_checkpoint'))
-        repo_path = str(gp('e2e_repo_path'))
-        self._load_e2e_model(repo_path, ckpt_path)
+        self._model_type = str(gp('model_type')).lower().strip()
+        if self._model_type == 'detr':
+            self._load_detr_model(
+                str(gp('e2e_repo_path')), str(gp('model_checkpoint')))
+        elif self._model_type == 'heatmap':
+            self._load_heatmap_model(
+                str(gp('heatmap_repo_path')), str(gp('heatmap_checkpoint')),
+                sample_threshold=float(gp('heatmap_sample_threshold')),
+                sample_min_dist=float(gp('heatmap_sample_min_dist')),
+                sample_window=int(gp('heatmap_sample_window')),
+            )
+        else:
+            raise ValueError(
+                f'model_type={self._model_type!r} not understood; '
+                'use "detr" or "heatmap".'
+            )
 
         # image_size / crop_top_frac: param override, else checkpoint args.
         img_size_param = int(gp('image_size'))
@@ -210,11 +299,16 @@ class OdinNavGraphE2ENode(Node):
         else:
             self._cam_K = None  # filled by the first CameraInfo message
         self._debug_dir = Path(str(gp('debug_overlay_dir')))
-        self._debug_dir.mkdir(parents=True, exist_ok=True)
-        self.get_logger().info(
-            f'Debug overlays -> {self._debug_dir} '
-            f'(every {self._debug_every_n} processed frames)'
-        )
+        if self._save_overlay_enabled:
+            self._debug_dir.mkdir(parents=True, exist_ok=True)
+            self.get_logger().info(
+                f'Debug overlays -> {self._debug_dir} '
+                f'(every {self._debug_every_n} processed frames)'
+            )
+        else:
+            self.get_logger().info(
+                'Debug overlays disabled (pass -p save_overlay:=true to enable).'
+            )
 
         # ── State ─────────────────────────────────────────────────────
         self.odom_buf: deque[Tuple[float, Odometry]] = deque()
@@ -226,6 +320,14 @@ class OdinNavGraphE2ENode(Node):
         self.global_ids = torch.empty(
             (0,), dtype=torch.long, device=self._device)
         self._next_node_id = 0
+        # Edge set: write-once, dedup'd by sorted global-ID pair.
+        # _node_degrees enforces the max_edges_per_node cap.
+        from collections import defaultdict as _defaultdict
+        self.global_edges: set = set()
+        self._node_degrees: dict = _defaultdict(int)
+        # Cached probability heatmap from the most recent forward — used by
+        # the per-frame edge builder.  None when running DETR mode.
+        self._last_hm_prob: Optional[torch.Tensor] = None
 
         # ── Subscribers / publishers ──────────────────────────────────
         self.create_subscription(Odometry, odom_topic, self.odom_callback, 100)
@@ -238,6 +340,11 @@ class OdinNavGraphE2ENode(Node):
         self.nodes_pub = self.create_publisher(PointCloud2, '~/graph_nodes', 1)
         # One TEXT marker per node showing its ID — IDs match the overlay.
         self.ids_pub = self.create_publisher(MarkerArray, '~/graph_node_ids', 1)
+        # Marker LINE_LIST of all global edges (heatmap mode only).
+        self.edges_pub = self.create_publisher(Marker, '~/graph_edges', 1)
+        # Manual prune trigger — publish std_msgs/Empty to fire on demand.
+        self.create_subscription(
+            Empty, str(gp('prune_trigger_topic')), self._prune_trigger_cb, 1)
 
         self.get_logger().info(
             f'Ready | image={image_topic} odom={odom_topic} '
@@ -248,7 +355,7 @@ class OdinNavGraphE2ENode(Node):
     #  Model loading / inference
     # ──────────────────────────────────────────────────
 
-    def _load_e2e_model(self, repo_path: str, ckpt_path: str) -> None:
+    def _load_detr_model(self, repo_path: str, ckpt_path: str) -> None:
         """Build NavGraphDETR and load the checkpoint.
 
         Inlines the e2e repo's ``train.load_model`` so we only depend on
@@ -301,8 +408,79 @@ class OdinNavGraphE2ENode(Node):
         self._ckpt_image_size = int(a.get('image_size', 280))
         self._ckpt_crop_top_frac = float(a.get('crop_top_frac', 0.0))
         self.get_logger().info(
-            f'Model loaded. pos_mean={self._pos_mean_t.tolist()} '
+            f'DETR model loaded. pos_mean={self._pos_mean_t.tolist()} '
             f'pos_std={self._pos_std_t.tolist()}'
+        )
+
+    def _load_heatmap_model(
+        self,
+        repo_path: str,
+        ckpt_path: str,
+        sample_threshold: float,
+        sample_min_dist: float,
+        sample_window: int,
+    ) -> None:
+        """Build HeatmapNavModel and load the checkpoint.
+
+        Mirrors ``heatmap_model.train.load_model`` inline so we don't pull in
+        the training-only dependencies.  Also caches the two helper functions
+        used at inference: ``sample_nodes_from_heatmap`` (Poisson-disk pixel
+        sampler) and ``sample_pos_at_pixels`` (bilinear sampler on the per-
+        pixel 3-D position map).
+        """
+        if repo_path and os.path.isdir(repo_path) and repo_path not in sys.path:
+            sys.path.insert(0, repo_path)
+        try:
+            from model import HeatmapNavModel, sample_pos_at_pixels  # noqa: WPS433
+            from heatmap_utils import sample_nodes_from_heatmap  # noqa: WPS433
+        except Exception as exc:  # pragma: no cover  - defensive
+            raise RuntimeError(
+                f'Could not import HeatmapNavModel from heatmap repo at '
+                f'{repo_path!r}: {exc}'
+            ) from exc
+
+        self.get_logger().info(f'Loading heatmap model from {ckpt_path} ...')
+        ckpt = torch.load(ckpt_path, map_location=self._device, weights_only=False)
+        a = ckpt.get('args', {}) or {}
+
+        self._model = HeatmapNavModel(
+            variant=a.get('encoder', 'vits'),
+            freeze_encoder=False,
+            dropout=a.get('dropout', 0.0),
+            head_mid=a.get('head_mid', 128),
+        ).to(self._device)
+        self._model.load_state_dict(ckpt['model'])
+        self._model.eval()
+
+        pos_stats = ckpt['pos_stats']
+        self._pos_mean_t = torch.as_tensor(
+            pos_stats['mean'], dtype=torch.float32, device=self._device)
+        self._pos_std_t = torch.as_tensor(
+            pos_stats['std'], dtype=torch.float32, device=self._device)
+
+        self._ckpt_image_size = int(a.get('image_size', 518))
+        self._ckpt_crop_top_frac = float(a.get('crop_top_frac', 0.0))
+
+        # Sampler config: param overrides win, else use the checkpoint defaults.
+        self._heatmap_size = int(a.get('heatmap_size', 296))
+        self._sample_threshold = float(sample_threshold)
+        self._sample_min_dist = (
+            sample_min_dist if sample_min_dist > 0.0
+            else float(a.get('sample_min_dist', 8.0))
+        )
+        self._sample_window = (
+            sample_window if sample_window > 0
+            else int(a.get('sample_window', 1))
+        )
+        self._sample_nodes_fn = sample_nodes_from_heatmap
+        self._sample_pos_fn = sample_pos_at_pixels
+
+        self.get_logger().info(
+            f'Heatmap model loaded. pos_mean={self._pos_mean_t.tolist()} '
+            f'pos_std={self._pos_std_t.tolist()} '
+            f'heatmap_size={self._heatmap_size} '
+            f'sample[thr={self._sample_threshold} '
+            f'min_dist={self._sample_min_dist} window={self._sample_window}]'
         )
 
     def _preprocess(self, rgb: np.ndarray) -> torch.Tensor:
@@ -321,24 +499,70 @@ class OdinNavGraphE2ENode(Node):
         return tensor.to(self._device)
 
     def _infer_local_nodes(self, rgb: np.ndarray) -> torch.Tensor:
-        """Run the model and return (M, 3) node positions as a device tensor
-        in the model camera frame (x_fwd, y_down, z_left).
+        """Run the active model and return (M, 3) node positions as a device
+        tensor in the model camera frame (x_fwd, y_down, z_left).
 
-        Predictions are gated by score, then by forward range
-        (``max_node_range``) — the model has no depth awareness and predicts
-        nodes through walls / beyond dead ends, so anything too far ahead is
-        dropped before it can reach the graph.
+        Dispatches on ``model_type``; the forward-range gate is applied here
+        so it covers both branches uniformly.  The monocular model has no
+        depth / wall awareness and hallucinates nodes through walls / beyond
+        dead ends; ``max_node_range`` clips them before the graph sees them.
         """
         image_t = self._preprocess(rgb)
-        with torch.no_grad():
-            logits, pos = self._model(image_t)
-        keep = torch.sigmoid(logits[0]) >= self.score_threshold
-        nodes = pos[0][keep].float() * self._pos_std_t + self._pos_mean_t
+        if self._model_type == 'detr':
+            nodes = self._infer_detr(image_t)
+        else:
+            nodes = self._infer_heatmap(image_t)
 
         # Forward-range gate (x = forward depth in the model camera frame).
         if self.max_node_range > 0.0:
             nodes = nodes[nodes[:, 0] <= self.max_node_range]
         return nodes
+
+    def _infer_detr(self, image_t: torch.Tensor) -> torch.Tensor:
+        """NavGraphDETR forward: per-query (logit, 3-D pos).  Keeps queries
+        above ``score_threshold`` and denormalises in metric camera units."""
+        # DETR has no heatmap — the edge builder will see this and skip.
+        self._last_hm_prob = None
+        with torch.no_grad():
+            logits, pos = self._model(image_t)
+        keep = torch.sigmoid(logits[0]) >= self.score_threshold
+        return pos[0][keep].float() * self._pos_std_t + self._pos_mean_t
+
+    def _infer_heatmap(self, image_t: torch.Tensor) -> torch.Tensor:
+        """HeatmapNavModel forward:
+          1. Predict a dense traversability heatmap + a per-pixel 3-D map.
+          2. Upsample the heatmap to ``heatmap_size`` and Poisson-disk sample
+             evenly-spaced pixels with score >= sample_threshold.
+          3. Bilinearly sample the 3-D position map at those pixels and
+             denormalise.  Returns the (M, 3) device tensor of metric nodes.
+        Matches the heatmap repo's validate.py inference path exactly.
+        """
+        with torch.no_grad():
+            hm_logits, pos_map, _, _ = self._model(image_t)
+            hm_prob = torch.sigmoid(F.interpolate(
+                hm_logits.float(),
+                size=(self._heatmap_size, self._heatmap_size),
+                mode='bilinear', align_corners=False,
+            ))
+        # Cache for the per-frame edge builder.
+        self._last_hm_prob = hm_prob
+        # Sampler returns (x, y) pixel coords in the upsampled heatmap.
+        hm_np = hm_prob[0, 0].detach().cpu().numpy()
+        pix = self._sample_nodes_fn(
+            hm_np,
+            threshold=self._sample_threshold,
+            min_dist=self._sample_min_dist,
+            window=self._sample_window,
+        )
+        if len(pix) == 0:
+            return torch.empty((0, 3), dtype=torch.float32, device=self._device)
+
+        # (x, y) px -> [-1, 1] grid_sample coords, then bilinear sample.
+        pix_t = torch.from_numpy(pix).to(self._device)
+        grid = (2.0 * pix_t / float(self._heatmap_size) - 1.0).float()
+        with torch.no_grad():
+            pred_norm = self._sample_pos_fn(pos_map[0].float(), grid)  # (M, 3)
+        return pred_norm * self._pos_std_t + self._pos_mean_t
 
     # ──────────────────────────────────────────────────
     #  Callbacks
@@ -450,35 +674,68 @@ class OdinNavGraphE2ENode(Node):
         local_odom = local_cam @ R.T + t  # (M, 3) device tensor
 
         # 3) Merge local nodes into the persistent global graph.
-        n_added = self._merge_local_nodes(local_odom)
+        local_cam_kept, local_ids, n_added = self._merge_local_nodes(
+            local_cam, local_odom)
+
+        # 4) Build per-frame edges among the surviving local nodes (heatmap
+        #    mode only) and fold them into the global edge set.
+        n_new_edges = self._build_edges_for_frame(
+            local_cam_kept, local_ids, rgb.shape[:2])
 
         self.get_logger().info(
             f'frame {self.frame_count} local={local_odom.shape[0]} '
-            f'added={n_added} global={self.global_nodes.shape[0]}'
+            f'added={n_added} global={self.global_nodes.shape[0]} '
+            f'edges+={n_new_edges} total_edges={len(self.global_edges)}'
         )
 
-        # 4) Publish all global nodes (+ ID markers for RViz).
+        # 5) Optional periodic pruning: drop nodes that have zero edges.
+        if (self._prune_enabled
+                and (self.frame_count % self._prune_every_n) == 0):
+            n_pruned = self._prune_isolated_nodes()
+            if n_pruned > 0:
+                self.get_logger().info(
+                    f'[prune periodic] removed {n_pruned} isolated nodes; '
+                    f'global={self.global_nodes.shape[0]} '
+                    f'edges={len(self.global_edges)}'
+                )
+
+        # 6) Publish all global nodes (+ ID markers + edges for RViz).
         self._publish_nodes(stamp)
         self._publish_node_ids(stamp)
+        self._publish_edges(stamp)
 
-        # 5) Debug: every Nth frame, project this frame's local predictions
-        #    onto the camera image and save a labelled overlay.
-        if (self.frame_count % self._debug_every_n) == 0:
+        # 7) Debug: every Nth frame, project this frame's local predictions
+        #    onto the camera image and save a labelled overlay.  Off by
+        #    default — enable with -p save_overlay:=true.
+        if (self._save_overlay_enabled
+                and (self.frame_count % self._debug_every_n) == 0):
             self._save_overlay(rgb, local_cam)
 
-    def _merge_local_nodes(self, local_odom: torch.Tensor) -> int:
+    def _merge_local_nodes(
+        self,
+        local_cam: torch.Tensor,
+        local_odom: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
         """Vectorised GPU merge — no Python loops, mirrors the cdist-based
         merge in ``nav_graph``'s ``tensor_merge_local_nodes_gpu``.
 
         Two passes, both as a single ``torch.cdist``:
           1. intra-frame dedup — drop a local node if an earlier-indexed
              local node lies within ``merge_node_distance`` of it;
-          2. global merge — drop a (deduped) local node if any existing
-             global node lies within ``merge_node_distance``.
-        Survivors are appended to ``self.global_nodes`` in one ``cat``.
+          2. global merge — for each (deduped) local node, snap to the
+             nearest existing global node if within ``merge_node_distance``,
+             otherwise assign a fresh ID and append to the global graph.
+
+        Returns ``(local_cam_kept, local_ids, n_added)``:
+          * ``local_cam_kept`` — surviving local-node camera-frame positions
+            (same intra-frame dedup mask applied as to ``local_odom``).
+          * ``local_ids`` — global ID each surviving local node maps to
+            (existing ID if merged, fresh ID if new).
+          * ``n_added`` — number of fresh nodes appended this frame.
         """
         if local_odom.shape[0] == 0:
-            return 0
+            empty_ids = torch.empty((0,), dtype=torch.long, device=self._device)
+            return local_cam, empty_ids, 0
 
         md = self.merge_node_distance
 
@@ -486,26 +743,248 @@ class OdinNavGraphE2ENode(Node):
         # and node j is within md of node i -> node i is a duplicate.
         d_self = torch.cdist(local_odom, local_odom)
         is_dup = (d_self < md).tril(-1).any(dim=1)
-        local_odom = local_odom[~is_dup]
+        keep = ~is_dup
+        local_odom = local_odom[keep]
+        local_cam = local_cam[keep]
+        m_total = int(local_odom.shape[0])
 
-        # Pass 2: merge against the existing global graph.
+        # Pass 2: per-node assignment vs. the existing global graph.
         if self.global_nodes.shape[0] > 0:
             d_glob = torch.cdist(local_odom, self.global_nodes)
-            new_mask = d_glob.min(dim=1).values >= md
-            new_nodes = local_odom[new_mask]
+            min_vals, min_idx = d_glob.min(dim=1)
+            merged_mask = min_vals < md
         else:
-            new_nodes = local_odom
+            merged_mask = torch.zeros(m_total, dtype=torch.bool, device=self._device)
+            min_idx = torch.zeros(m_total, dtype=torch.long, device=self._device)
 
-        # Assign a stable ID to each surviving node.
-        m = int(new_nodes.shape[0])
-        new_ids = torch.arange(
-            self._next_node_id, self._next_node_id + m,
-            device=self._device, dtype=torch.long)
-        self._next_node_id += m
+        # Allocate the per-local-node ID tensor and fill the merged half.
+        local_ids = torch.empty(m_total, dtype=torch.long, device=self._device)
+        if merged_mask.any():
+            local_ids[merged_mask] = self.global_ids[min_idx[merged_mask]]
 
-        self.global_nodes = torch.cat([self.global_nodes, new_nodes], dim=0)
-        self.global_ids = torch.cat([self.global_ids, new_ids], dim=0)
-        return m
+        # Fresh IDs for the new-half; append positions + IDs to the global graph.
+        new_mask = ~merged_mask
+        n_added = int(new_mask.sum().item())
+        if n_added > 0:
+            new_ids = torch.arange(
+                self._next_node_id, self._next_node_id + n_added,
+                device=self._device, dtype=torch.long)
+            self._next_node_id += n_added
+            local_ids[new_mask] = new_ids
+            self.global_nodes = torch.cat(
+                [self.global_nodes, local_odom[new_mask]], dim=0)
+            self.global_ids = torch.cat([self.global_ids, new_ids], dim=0)
+
+        return local_cam, local_ids, n_added
+
+    def _build_edges_for_frame(
+        self,
+        local_cam: torch.Tensor,
+        local_ids: torch.Tensor,
+        img_hw: Tuple[int, int],
+    ) -> int:
+        """Heatmap-line-check edge builder.  Heatmap mode only — DETR has no
+        traversability map to check against.
+
+        For each pair of this frame's surviving local nodes within
+        ``max_edge_distance`` (3-D), sample N points along the line in the
+        camera frame, project them to the heatmap, and keep the pair only if
+        the minimum heatmap probability along the line clears
+        ``edge_traversability_threshold``.  Surviving pairs are added (sorted
+        by global ID) to ``self.global_edges`` write-once, respecting
+        ``max_edges_per_node`` on each endpoint, with the shortest candidates
+        added first so the local k-NN feel is preserved.
+
+        Returns the number of *newly* added global edges.
+        """
+        if (self._model_type != 'heatmap'
+                or self._last_hm_prob is None
+                or self._cam_K is None):
+            return 0
+        m = int(local_cam.shape[0])
+        if m < 2:
+            return 0
+
+        # ── 1. candidate pairs within max_edge_distance, upper triangle only.
+        d = torch.cdist(local_cam, local_cam)
+        iu, ju = torch.triu_indices(m, m, offset=1, device=self._device)
+        pair_d = d[iu, ju]
+        keep = pair_d <= self.max_edge_distance
+        if not keep.any():
+            return 0
+        pi = iu[keep]
+        pj = ju[keep]
+        pair_d = pair_d[keep]
+        K = int(pi.shape[0])
+
+        # ── 2. sample N points along each line in the camera frame.
+        N = self.edge_line_samples
+        a = local_cam[pi]                                       # (K, 3)
+        b = local_cam[pj]                                       # (K, 3)
+        ts = torch.linspace(0.0, 1.0, N, device=self._device).view(1, N, 1)
+        line = a.unsqueeze(1) * (1.0 - ts) + b.unsqueeze(1) * ts  # (K, N, 3)
+        flat = line.reshape(-1, 3)                              # (K*N, 3)
+        x = flat[:, 0]
+        y = flat[:, 1]
+        z = flat[:, 2]
+        behind = x <= 0.1
+        x_safe = x.clamp(min=1e-3)
+
+        # ── 3. project camera-frame line samples to heatmap pixel coords.
+        K_mat = self._cam_K
+        fx = float(K_mat[0, 0]); fy = float(K_mat[1, 1])
+        cx = float(K_mat[0, 2]); cy = float(K_mat[1, 2])
+        H_img, W_img = img_hw
+        crop_top_px = int(self._crop_top_frac * H_img)
+        H_visible = max(1, H_img - crop_top_px)
+        hm_size = self._heatmap_size
+
+        u = cx + fx * (-z) / x_safe                             # original-image px
+        v_after_crop = (cy + fy * y / x_safe) - float(crop_top_px)
+        # Re-scale to model-input (= heatmap_size pixels at heatmap_size grid).
+        u_hm = u * (hm_size / float(W_img))
+        v_hm = v_after_crop * (hm_size / float(H_visible))
+        gx = 2.0 * u_hm / float(hm_size) - 1.0
+        gy = 2.0 * v_hm / float(hm_size) - 1.0
+        # In-bounds = in front of camera *and* projection lands inside the
+        # heatmap.  Out-of-bounds samples are dropped from the vote (they
+        # don't count for or against the edge) so near-image-edge lines
+        # whose perspective bends a sample just off the heatmap aren't
+        # silently rejected.
+        in_bounds = (~behind) & (gx >= -1.0) & (gx <= 1.0) \
+                              & (gy >= -1.0) & (gy <= 1.0)
+        grid = torch.stack([gx, gy], dim=-1).view(1, -1, 1, 2)
+
+        # ── 4. one grid_sample for all K*N points; reshape, vote per line.
+        vals = F.grid_sample(
+            self._last_hm_prob, grid,
+            mode='bilinear', padding_mode='zeros', align_corners=False,
+        ).view(K, N)
+        in_bounds = in_bounds.view(K, N)
+        # Fraction-passing: of the *in-bounds* samples, what fraction clear
+        # threshold?  Strict-min (the old behaviour) is recovered by
+        # setting edge_line_min_pass_fraction=1.0.  This is far more robust
+        # to the natural heatmap softness at the image boundary.
+        passes = in_bounds & (vals >= self.edge_traversability_threshold)
+        n_in = in_bounds.sum(dim=1)
+        n_pass = passes.sum(dim=1)
+        frac = n_pass.float() / n_in.clamp(min=1).float()
+        edge_ok = (n_in >= self.edge_line_min_in_bounds) \
+                  & (frac >= self.edge_line_min_pass_fraction)
+        if not edge_ok.any():
+            return 0
+
+        # ── 5. sort surviving candidates by length (shortest first),
+        #       then add to the global set respecting per-node degree caps.
+        pi_ok = pi[edge_ok]
+        pj_ok = pj[edge_ok]
+        d_ok = pair_d[edge_ok]
+        order = torch.argsort(d_ok)
+        pi_ok = pi_ok[order].cpu().numpy()
+        pj_ok = pj_ok[order].cpu().numpy()
+        ids_np = local_ids.cpu().numpy()
+
+        cap = self.max_edges_per_node
+        n_new = 0
+        for li, lj in zip(pi_ok.tolist(), pj_ok.tolist()):
+            a_id = int(ids_np[li])
+            b_id = int(ids_np[lj])
+            if a_id == b_id:
+                continue  # both locals snapped to the same global node
+            key = (a_id, b_id) if a_id < b_id else (b_id, a_id)
+            if key in self.global_edges:
+                continue
+            if cap > 0 and (self._node_degrees[a_id] >= cap
+                            or self._node_degrees[b_id] >= cap):
+                continue
+            self.global_edges.add(key)
+            self._node_degrees[a_id] += 1
+            self._node_degrees[b_id] += 1
+            n_new += 1
+        return n_new
+
+    def _publish_edges(self, stamp) -> None:
+        """Publish the global edge set as a Marker LINE_LIST (odom frame).
+        Edge endpoints are looked up from ``global_nodes`` via the parallel
+        ``global_ids`` tensor and lifted by ``viz_z_offset`` (viz-only)."""
+        if not self.global_edges or self.global_nodes.shape[0] == 0:
+            # Always publish a DELETE so RViz clears stale edges when the
+            # graph is reset upstream.  Cheap.
+            return
+        ids_np = self.global_ids.detach().cpu().numpy().astype(np.int64)
+        pos_np = self.global_nodes.detach().cpu().numpy().astype(np.float32, copy=True)
+        pos_np[:, 2] += self.viz_z_offset
+
+        # ID -> row-index lookup over the dense ID range.
+        max_id = int(ids_np.max()) + 1
+        id_to_idx = -np.ones(max_id, dtype=np.int64)
+        id_to_idx[ids_np] = np.arange(ids_np.shape[0], dtype=np.int64)
+
+        m = Marker()
+        m.header = Header(stamp=stamp, frame_id=self.frame_id)
+        m.ns = 'graph_edges'
+        m.id = 0
+        m.type = Marker.LINE_LIST
+        m.action = Marker.ADD
+        m.scale.x = 0.04
+        m.color.r = 0.2
+        m.color.g = 1.0
+        m.color.b = 0.2
+        m.color.a = 0.8
+        m.pose.orientation.w = 1.0
+
+        for a_id, b_id in self.global_edges:
+            ia = id_to_idx[a_id]
+            ib = id_to_idx[b_id]
+            if ia < 0 or ib < 0:
+                continue
+            pa = pos_np[ia]
+            pb = pos_np[ib]
+            m.points.append(Point(x=float(pa[0]), y=float(pa[1]), z=float(pa[2])))
+            m.points.append(Point(x=float(pb[0]), y=float(pb[1]), z=float(pb[2])))
+        self.edges_pub.publish(m)
+
+    def _prune_isolated_nodes(self) -> int:
+        """Remove every global node whose edge degree is 0.
+
+        Stable IDs let us prune from the storage tensors without breaking
+        the edge set — surviving nodes keep their IDs, and the edge set
+        only ever references nodes with degree >= 1.  ``_next_node_id``
+        keeps marching forward, so pruned IDs are never reused.
+
+        Returns the number of nodes removed.
+        """
+        n = int(self.global_nodes.shape[0])
+        if n == 0:
+            return 0
+        ids_list = self.global_ids.cpu().tolist()
+        keep_py = [self._node_degrees.get(int(nid), 0) > 0 for nid in ids_list]
+        n_pruned = keep_py.count(False)
+        if n_pruned == 0:
+            return 0
+        # Drop the per-node degree entries for pruned IDs (all zero anyway).
+        for nid, k in zip(ids_list, keep_py):
+            if not k:
+                self._node_degrees.pop(int(nid), None)
+        keep_mask = torch.tensor(
+            keep_py, dtype=torch.bool, device=self._device)
+        self.global_nodes = self.global_nodes[keep_mask]
+        self.global_ids = self.global_ids[keep_mask]
+        return n_pruned
+
+    def _prune_trigger_cb(self, _msg: Empty) -> None:
+        """Manual-prune callback — always active regardless of the periodic
+        switch.  Trigger from any terminal with::
+
+            ros2 topic pub --once \
+              /odin_nav_graph_e2e_node/prune_now std_msgs/msg/Empty {}
+        """
+        n_pruned = self._prune_isolated_nodes()
+        self.get_logger().info(
+            f'[prune trigger] removed {n_pruned} isolated nodes; '
+            f'global={self.global_nodes.shape[0]} '
+            f'edges={len(self.global_edges)}'
+        )
 
     def _save_overlay(self, rgb: np.ndarray, local_cam: torch.Tensor) -> None:
         """Project this frame's *local* predictions onto the camera image and
@@ -596,7 +1075,9 @@ class OdinNavGraphE2ENode(Node):
             m.action = Marker.ADD
             m.pose.position.x = float(pos[0])
             m.pose.position.y = float(pos[1])
-            m.pose.position.z = float(pos[2]) + 0.25  # float text above node
+            # viz_z_offset matches the PointCloud2 lift; +0.25 floats the text
+            # marker above the dot in the same lifted plane.
+            m.pose.position.z = float(pos[2]) + self.viz_z_offset + 0.25
             m.pose.orientation.w = 1.0
             m.scale.z = 0.25  # text height (m)
             m.color.r = 1.0
@@ -614,6 +1095,7 @@ class OdinNavGraphE2ENode(Node):
         # Single device->host transfer of the whole graph.
         packed = np.empty((n, 4), dtype=np.float32)
         packed[:, :3] = self.global_nodes.detach().cpu().numpy()
+        packed[:, 2] += self.viz_z_offset  # viz-only lift above the floor
         packed[:, 3] = 1.0  # constant intensity
 
         cloud = PointCloud2()
@@ -644,10 +1126,19 @@ def _se3_rot(R: np.ndarray) -> np.ndarray:
 def main(args=None):
     rclpy.init(args=args)
     node = OdinNavGraphE2ENode()
-    with suppress(KeyboardInterrupt):
-        rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        with suppress(KeyboardInterrupt):
+            rclpy.spin(node)
+    finally:
+        if node.prune_on_shutdown:
+            n_pruned = node._prune_isolated_nodes()
+            node.get_logger().info(
+                f'[prune shutdown] removed {n_pruned} isolated nodes; '
+                f'global={node.global_nodes.shape[0]} '
+                f'edges={len(node.global_edges)}'
+            )
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':

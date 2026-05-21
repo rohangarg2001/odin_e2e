@@ -13,8 +13,6 @@ ros2 run odin_nav_graph nav_graph_node --ros-args \
   -p cam_fy:=800.0 \
   -p cam_cx:=800.0 \
   -p cam_cy:=648.0 \
-  -p map_length_xy:=30.0 \
-  -p cloud_max_range:=15.0 \
   -p enable_explorfm_layers:=true \
   -p explorfm_frontier_ckpt:="${CKPTS}/frontier_head.ckpt" \
   -p explorfm_trav_ckpt:="${CKPTS}/trav_head.ckpt" \

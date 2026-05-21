@@ -49,6 +49,7 @@ import cv2
 import json
 from pathlib import Path
 from scipy.spatial.transform import Rotation as _ScipyR
+from scipy.ndimage import binary_dilation
 
 # Allow running without pip-installing nav_graph by adding the sibling
 # ``nav_graph_gpu`` checkout to sys.path.  Pip-installed nav_graph wins.
@@ -213,6 +214,50 @@ def _make_traversability_smoother(builder, median_size: int):
         result[smoothed <= 0.25] = 0.0   # majority occupied
         # 0.25 < smoothed < 0.75 stays NaN (genuinely mixed neighbourhood)
         return result
+
+    builder._compute_traversability = _patched
+
+
+def _make_obstacle_unknown_dilator(builder, obs_iters: int, unknown_iters: int):
+    """Wrap ``_compute_traversability`` to dilate obstacles, then unknown.
+
+    Runs *after* the median smoother (install this last).  Two sequential
+    passes on the categorical traversability map (free=1.0, unknown=NaN,
+    occupied=0.0):
+
+      1. Dilate occupied cells outward by ``obs_iters`` iterations of a
+         3×3 structuring element.  Free cells abutting obstacles become
+         occupied → no narrow free strips hugging walls.
+      2. Dilate unknown cells outward by ``unknown_iters`` iterations,
+         but never overwrite obstacles.  Free cells abutting unknown
+         become unknown → no narrow free strips between obstacles and
+         unknown space (the case the sampler keeps grabbing).
+
+    At 0.10 m/cell, ``iters=N`` ≈ N·10 cm of growth.  Either count ≤ 0
+    disables that pass; both ≤ 0 is a no-op.
+    """
+    if obs_iters <= 0 and unknown_iters <= 0:
+        return
+
+    orig_fn = builder._compute_traversability  # callable
+
+    def _patched(elevation: np.ndarray, config):
+        trav = orig_fn(elevation, config)
+        if trav is None:
+            return trav
+        out = trav.copy()
+        if obs_iters > 0:
+            occ = (out == 0.0)
+            if occ.any():
+                occ_d = binary_dilation(occ, iterations=obs_iters)
+                out[occ_d] = 0.0
+        if unknown_iters > 0:
+            unk = np.isnan(out)
+            if unk.any():
+                unk_d = binary_dilation(unk, iterations=unknown_iters)
+                # Don't overwrite obstacles; only convert free → unknown.
+                out[unk_d & (out == 1.0)] = np.nan
+        return out
 
     builder._compute_traversability = _patched
 
@@ -437,12 +482,12 @@ class OdinNavGraphNode(Node):
         # Elevation map geometry
         self.declare_parameter('map_length_xy', 12.0)
         self.declare_parameter('map_resolution', 0.10)
-        self.declare_parameter('cloud_max_range', 8.0)
+        self.declare_parameter('cloud_max_range', 7.0)
         self.declare_parameter('sensor_noise_factor', 0.05)
         # Drop elevation cells whose absolute height differs from the robot's
         # current odom z by more than this many metres (catches roofs/ceilings
         # the lidar sweeps in).  0 disables the filter.
-        self.declare_parameter('elevation_z_clip', 1.0)
+        self.declare_parameter('elevation_z_clip', 0.9)
         self.declare_parameter('em_position_noise', 0.0)
         self.declare_parameter('em_orientation_noise', 0.0)
 
@@ -452,23 +497,24 @@ class OdinNavGraphNode(Node):
 
         # nav_graph builder params
         self.declare_parameter('safety_distance', 0.05)
-        self.declare_parameter('merge_node_distance', 0.5)
-        self.declare_parameter('global_merge_distance', 0.5)
-        self.declare_parameter('global_max_candidate_edge_distance', 1.2)
-        self.declare_parameter('free_space_sampling_threshold', 0.35)
+        self.declare_parameter('merge_node_distance', 0.6)
+        self.declare_parameter('global_merge_distance', 0.6)
+        self.declare_parameter('global_max_candidate_edge_distance', 3.0)
+        self.declare_parameter('free_space_sampling_threshold', 0.50)
+        self.declare_parameter('boundary_inflation_factor', 1.2)
 
-        self.declare_parameter('frontier_kernel_size', 5)
+        self.declare_parameter('frontier_kernel_size', 2)
         self.declare_parameter('frontier_odom_threshold', 1.0)
         self.declare_parameter('frontier_max_edge_connectivity', 14)
-        self.declare_parameter('minimum_distance_between_frontiers', 0.05)
+        self.declare_parameter('minimum_distance_between_frontiers', 0.01)
         self.declare_parameter('minimum_points_in_cluster', 1)
         # Fraction of the neighbourhood window (relative to its area) that must
         # be free / unknown for a cell to qualify as a frontier.
-        self.declare_parameter('frontier_min_free_fraction', 0.15)
-        self.declare_parameter('frontier_min_unknown_fraction', 0.05)
+        self.declare_parameter('frontier_min_free_fraction', 0.25)
+        self.declare_parameter('frontier_min_unknown_fraction', 0.25)
 
         # Elevation -> traversability params
-        self.declare_parameter('elev_max_height_diff', 0.5)
+        self.declare_parameter('elev_max_height_diff', 0.7)
         self.declare_parameter('elev_max_slope', 1.0)
         self.declare_parameter('elev_gaussian_sigma', 0.5)
         self.declare_parameter('elev_window_size', 5)
@@ -482,6 +528,12 @@ class OdinNavGraphNode(Node):
         # Must be an odd integer >= 3.  0 or 1 disables.  At 0.10 m/cell, size=3
         # removes single-cell speckles (10 cm); size=5 removes up to 20 cm features.
         self.declare_parameter('trav_median_filter_size', 5)
+        # Categorical dilation pass that runs after the median smoother.
+        # Counters narrow free strips next to obstacles / unknown space that the
+        # sampler keeps picking up.  At 0.10 m/cell, iters=N ≈ N·10 cm of growth.
+        # Either ≤ 0 disables that pass.
+        self.declare_parameter('trav_obstacle_dilate_iters', 1)
+        self.declare_parameter('trav_unknown_dilate_iters', 1)
 
         # Throttling / publishing
         self.declare_parameter('process_every_n', 1)
@@ -491,8 +543,8 @@ class OdinNavGraphNode(Node):
         # Heights in [z_min, z_max] are linearly quantised to 0..100; cells
         # outside the range are clamped; unknown cells become -1.
         self.declare_parameter('publish_elevation_grid', True)
-        self.declare_parameter('elevation_grid_z_min', -1.0)
-        self.declare_parameter('elevation_grid_z_max', 3.0)
+        self.declare_parameter('elevation_grid_z_min', -4.0)
+        self.declare_parameter('elevation_grid_z_max', 10.0)
         self.declare_parameter('publish_edges', True)
         self.declare_parameter('max_edges_published', 100000)
         # Safety: if the global graph blows up past this many nodes,
@@ -533,7 +585,7 @@ class OdinNavGraphNode(Node):
         self.declare_parameter('cam_base_qw',  0.5005)
 
         # ExploRFM (per-image traversability + frontier-score model) → node layers
-        self.declare_parameter('enable_explorfm_layers', False)
+        self.declare_parameter('enable_explorfm_layers', True)
         self.declare_parameter('explorfm_every_n_images', 1)
         self.declare_parameter('explorfm_frontier_ckpt', '')
         self.declare_parameter('explorfm_trav_ckpt', '')
@@ -602,12 +654,13 @@ class OdinNavGraphNode(Node):
         # ── nav_graph config ──────────────────────────────────────────
         cfg = NavGraphConfig(
             free_space_sampling_threshold=float(gp('free_space_sampling_threshold')),
+            boundary_inflation_factor=float(gp('boundary_inflation_factor')),
             safety_distance=float(gp('safety_distance')),
             merge_node_distance=float(gp('merge_node_distance')),
             global_merge_distance=float(gp('global_merge_distance')),
             global_max_candidate_edge_distance=float(gp('global_max_candidate_edge_distance')),
             global_max_candidate_edge_search_distance = 100,
-            global_max_connections = 12,
+            global_max_connections = 13,
             elevation_min_filter_radius=self._z_lookup_min_filter_radius_cells,
             frontier=FrontierConfig(
                 kernel_size=int(gp('frontier_kernel_size')),
@@ -632,11 +685,20 @@ class OdinNavGraphNode(Node):
         self.builder = NavigationGraphBuilder(cfg)
         # Real-world robustness wrappers (per-node Z is handled in-core now).
         _install_builder_patches(self.builder)
-        trav_median_size = int(gp('trav_median_filter_size'))
-        _make_traversability_smoother(self.builder, trav_median_size)
+        self._trav_median_filter_size = int(gp('trav_median_filter_size'))
+        self._trav_obstacle_dilate_iters = int(gp('trav_obstacle_dilate_iters'))
+        self._trav_unknown_dilate_iters = int(gp('trav_unknown_dilate_iters'))
+        _make_traversability_smoother(self.builder, self._trav_median_filter_size)
+        _make_obstacle_unknown_dilator(
+            self.builder,
+            self._trav_obstacle_dilate_iters,
+            self._trav_unknown_dilate_iters,
+        )
         self.get_logger().info(
             f'NavigationGraphBuilder ready '
-            f'(ext-map fixup + trav-smoother size={trav_median_size} '
+            f'(ext-map fixup + trav-smoother size={self._trav_median_filter_size} '
+            f'+ obs_dilate={self._trav_obstacle_dilate_iters} '
+            f'unk_dilate={self._trav_unknown_dilate_iters} '
             f'patches installed).'
         )
 
@@ -982,9 +1044,11 @@ class OdinNavGraphNode(Node):
             )
             self.builder.reset()
             _install_builder_patches(self.builder)
-            _make_traversability_smoother(
+            _make_traversability_smoother(self.builder, self._trav_median_filter_size)
+            _make_obstacle_unknown_dilator(
                 self.builder,
-                int(self.get_parameter('trav_median_filter_size').value),
+                self._trav_obstacle_dilate_iters,
+                self._trav_unknown_dilate_iters,
             )
             return
 
@@ -1603,7 +1667,7 @@ class OdinNavGraphNode(Node):
 
         t0 = time.perf_counter()
         trav_t, front_t, ad_feats_t = self._explorfm.forward_on_numpy(rgb)
-        # Both tensors are (1, 1, H, W) on cuda, sized to the input rgb.
+        # trav_t and front_t are (1, 1, H, W) on cuda, sized to the input rgb. ad_feats_t is (1, D, hp, wp)
         trav_np = trav_t[0, 0].detach().float().cpu().numpy()
         front_np = front_t[0, 0].detach().float().cpu().numpy()
         infer_ms = (time.perf_counter() - t0) * 1000.0
@@ -1620,8 +1684,8 @@ class OdinNavGraphNode(Node):
             front_vals_full[front_mask] = front_np[v[front_mask], u[front_mask]].astype(np.float32)
 
         device = self.builder.global_builder._global_pos.device
-        ids_t = torch.from_numpy(ids_np).to(device=device, dtype=torch.long)
-        trav_vals_t = torch.from_numpy(trav_vals).to(device=device, dtype=torch.float32)
+        # ids_t = torch.from_numpy(ids_np).to(device=device, dtype=torch.long)
+        # trav_vals_t = torch.from_numpy(trav_vals).to(device=device, dtype=torch.float32)
         # Traversability layer disabled.
         # self.builder.ingest_layer_scores(self._trav_layer_name, ids_t, trav_vals_t)
 
