@@ -26,8 +26,12 @@ ros2 run odin_nav_graph nav_graph_node_e2e --ros-args \
 
 from __future__ import annotations
 
+import csv
+import json
+import math
 import os
 import sys
+import time
 from collections import deque
 from contextlib import suppress
 from pathlib import Path
@@ -212,6 +216,39 @@ class OdinNavGraphE2ENode(Node):
         self.declare_parameter('cam_base_qz', -0.4996)
         self.declare_parameter('cam_base_qw',  0.5005)
 
+        # ── Graph-comparison artefacts ───────────────────────────────────
+        # Final-graph snapshot (Ctrl-C aware) + per-frame timing CSV.  Paths
+        # default to the comparison directory so the script reads them
+        # without configuration.  Empty string disables the corresponding
+        # writer.
+        self.declare_parameter(
+            'graph_snapshot_path',
+            '/home/rohang73/Documents/odin_e2e/graph_compaRISION/inputs/nav_graph_node_e2e.json',
+        )
+        self.declare_parameter(
+            'timing_csv_path',
+            '/home/rohang73/Documents/odin_e2e/graph_compaRISION/inputs/nav_graph_node_e2e_timing.csv',
+        )
+        self.declare_parameter('enable_graph_snapshot_save', True)
+
+        # ── Inference-time tuning knobs ──────────────────────────────────
+        # All three default ON — they're independently revertable if any
+        # one causes numerical issues or compile failures on a given GPU.
+        #   enable_cudnn_benchmark — toggle torch.backends.cudnn.benchmark.
+        #       Lets cuDNN pick its fastest kernel for our fixed input
+        #       shape after a 1-2 frame warmup.
+        #   enable_amp_autocast    — wrap the model forward in
+        #       torch.amp.autocast(dtype=float16).  Usually 1.5-2× speedup
+        #       on Ampere+ with no quality loss for ViT-based encoders.
+        #   enable_torch_compile   — torch.compile with mode='reduce-overhead'.
+        #       Pays a 10-30 s JIT cost on the first forward; afterwards
+        #       another 1.2-2× speedup typical.  Set false if compile
+        #       errors / shape-instability is observed.
+        self.declare_parameter('enable_cudnn_benchmark', True)
+        self.declare_parameter('enable_amp_autocast',    True)
+        self.declare_parameter('enable_torch_compile',   True)
+        self.declare_parameter('enable_timing_csv', True)
+
         gp = lambda n: self.get_parameter(n).value  # noqa: E731
         image_topic = str(gp('image_topic'))
         odom_topic = str(gp('odom_topic'))
@@ -253,6 +290,30 @@ class OdinNavGraphE2ENode(Node):
 
         # ── Load the e2e model (DETR or heatmap) ──────────────────────
         self._device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        # Latch the inference-tuning knobs onto the instance; the model
+        # loaders + inference paths read them directly.
+        self._enable_cudnn_benchmark = bool(gp('enable_cudnn_benchmark'))
+        self._enable_amp_autocast    = bool(gp('enable_amp_autocast'))
+        self._enable_torch_compile   = bool(gp('enable_torch_compile'))
+        self._on_cuda = (self._device.type == 'cuda')
+        # cuDNN auto-tunes its kernel choice for the first 1-2 forwards
+        # then sticks with the fastest one — only safe when input shape
+        # is fixed, which it is here (always (1, 3, image_size, image_size)).
+        if self._on_cuda and self._enable_cudnn_benchmark:
+            torch.backends.cudnn.benchmark = True
+            self.get_logger().info('torch.backends.cudnn.benchmark = True')
+
+        # GPU-resident ImageNet normalization tensors so _preprocess can
+        # do the whole pipeline on-device without touching numpy.  Built
+        # once at init since the model device never changes.
+        self._mean_t = torch.as_tensor(
+            IMAGENET_MEAN, dtype=torch.float32, device=self._device,
+        ).view(1, 3, 1, 1)
+        self._std_t = torch.as_tensor(
+            IMAGENET_STD, dtype=torch.float32, device=self._device,
+        ).view(1, 3, 1, 1)
+
         self._model_type = str(gp('model_type')).lower().strip()
         if self._model_type == 'detr':
             self._load_detr_model(
@@ -351,9 +412,67 @@ class OdinNavGraphE2ENode(Node):
             f'frame={self.frame_id} device={self._device}'
         )
 
+        # ── Graph-comparison artefacts ───────────────────────────────────
+        self._save_snapshot_enabled = bool(gp('enable_graph_snapshot_save'))
+        self._graph_snapshot_path: Optional[Path] = (
+            Path(str(gp('graph_snapshot_path'))).expanduser()
+            if self._save_snapshot_enabled and str(gp('graph_snapshot_path')).strip()
+            else None
+        )
+        if self._graph_snapshot_path is not None:
+            self._graph_snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            self.get_logger().info(
+                f'Final-graph snapshot will write to {self._graph_snapshot_path}'
+            )
+
+        self._timing_csv_writer = None
+        self._timing_csv_file = None
+        self._timing_csv_cols = [
+            'frame_index', 'frame_timestamp_sec',
+            'num_local_nodes_pre', 'num_local_nodes_kept', 'num_new_nodes',
+            'num_nodes', 'num_edges', 'num_new_edges',
+            't_inference_ms', 't_merge_ms', 't_edges_ms', 't_other_ms',
+            't_frame_total_ms',
+        ]
+        if bool(gp('enable_timing_csv')):
+            csv_path_str = str(gp('timing_csv_path')).strip()
+            if csv_path_str:
+                csv_path = Path(csv_path_str).expanduser()
+                csv_path.parent.mkdir(parents=True, exist_ok=True)
+                self._timing_csv_file = open(csv_path, 'w', newline='', buffering=1)
+                self._timing_csv_writer = csv.DictWriter(
+                    self._timing_csv_file, fieldnames=self._timing_csv_cols,
+                )
+                self._timing_csv_writer.writeheader()
+                self.get_logger().info(f'Per-frame timing CSV → {csv_path}')
+
     # ──────────────────────────────────────────────────
     #  Model loading / inference
     # ──────────────────────────────────────────────────
+
+    def _maybe_compile_model(self) -> None:
+        """Wrap ``self._model`` with ``torch.compile`` if enabled.
+
+        ``mode='reduce-overhead'`` uses CUDA graphs for low-latency
+        repeated calls — safe because our input shape is locked to
+        ``(1, 3, image_size, image_size)`` for the lifetime of the node.
+        Falls back silently to eager mode if compile errors out (e.g.
+        the model has dynamic Python control flow ``torch.compile`` can't
+        trace).  First inference pays a 10-30 s JIT cost; subsequent
+        calls amortise it.
+        """
+        if not self._enable_torch_compile or not self._on_cuda:
+            return
+        try:
+            self._model = torch.compile(self._model, mode='reduce-overhead')
+            self.get_logger().info(
+                "torch.compile enabled (mode='reduce-overhead'); "
+                'first inference will JIT (~10-30 s).'
+            )
+        except Exception as exc:  # pragma: no cover  - defensive
+            self.get_logger().warning(
+                f'torch.compile unavailable / failed: {exc}; running eager.'
+            )
 
     def _load_detr_model(self, repo_path: str, ckpt_path: str) -> None:
         """Build NavGraphDETR and load the checkpoint.
@@ -397,6 +516,7 @@ class OdinNavGraphE2ENode(Node):
         state = {_ph_remap.get(k, k): v for k, v in ckpt['model'].items()}
         self._model.load_state_dict(state)
         self._model.eval()
+        self._maybe_compile_model()
 
         # Kept as device tensors so denormalisation stays on the GPU.
         pos_stats = ckpt['pos_stats']
@@ -451,6 +571,7 @@ class OdinNavGraphE2ENode(Node):
         ).to(self._device)
         self._model.load_state_dict(ckpt['model'])
         self._model.eval()
+        self._maybe_compile_model()
 
         pos_stats = ckpt['pos_stats']
         self._pos_mean_t = torch.as_tensor(
@@ -484,19 +605,29 @@ class OdinNavGraphE2ENode(Node):
         )
 
     def _preprocess(self, rgb: np.ndarray) -> torch.Tensor:
-        """HxWx3 uint8 RGB -> (1,3,S,S) normalised tensor, matching training."""
-        from PIL import Image as _PILImage
+        """HxWx3 uint8 RGB -> (1,3,S,S) normalised tensor.
 
-        img = _PILImage.fromarray(rgb)
-        w, h = img.size
-        crop_top_px = int(self._crop_top_frac * h)
-        if crop_top_px > 0:
-            img = img.crop((0, crop_top_px, w, h))
-        img = img.resize((self._image_size, self._image_size), _PILImage.BILINEAR)
-        arr = np.asarray(img, dtype=np.float32) / 255.0
-        arr = (arr - IMAGENET_MEAN) / IMAGENET_STD
-        tensor = torch.from_numpy(arr.transpose(2, 0, 1)).float().unsqueeze(0)
-        return tensor.to(self._device)
+        All steps (upload, top-crop, bilinear resize, ImageNet normalize)
+        run on the GPU.  Only the raw uint8 RGB buffer crosses host→device,
+        which is half the cost of uploading a normalized float32 tensor.
+
+        Output is bilinearly interpolated and ImageNet-normalized using
+        the same constants as the original PIL pipeline, so the model
+        sees the same statistics it was trained on.
+        """
+        t = torch.from_numpy(rgb).to(
+            self._device, dtype=torch.uint8, non_blocking=True,
+        )  # (H, W, 3) uint8
+        t = t.permute(2, 0, 1).contiguous().float().unsqueeze(0).div_(255.0)
+        if self._crop_top_frac > 0.0:
+            crop_top_px = int(self._crop_top_frac * t.shape[2])
+            if crop_top_px > 0:
+                t = t[:, :, crop_top_px:, :]
+        t = F.interpolate(
+            t, size=(self._image_size, self._image_size),
+            mode='bilinear', align_corners=False,
+        )
+        return (t - self._mean_t) / self._std_t
 
     def _infer_local_nodes(self, rgb: np.ndarray) -> torch.Tensor:
         """Run the active model and return (M, 3) node positions as a device
@@ -520,13 +651,26 @@ class OdinNavGraphE2ENode(Node):
 
     def _infer_detr(self, image_t: torch.Tensor) -> torch.Tensor:
         """NavGraphDETR forward: per-query (logit, 3-D pos).  Keeps queries
-        above ``score_threshold`` and denormalises in metric camera units."""
+        above ``score_threshold`` and denormalises in metric camera units.
+
+        Forward is wrapped in ``torch.amp.autocast(dtype=float16)`` on CUDA
+        — typically 1.5-2× speedup with no visible quality loss on the
+        ViT-based encoders we use here.  Disable with
+        ``-p enable_amp_autocast:=false`` if numerical issues appear.
+        """
         # DETR has no heatmap — the edge builder will see this and skip.
         self._last_hm_prob = None
-        with torch.no_grad():
+        use_amp = self._enable_amp_autocast and self._on_cuda
+        with torch.no_grad(), torch.amp.autocast(
+            device_type='cuda', dtype=torch.float16, enabled=use_amp,
+        ):
             logits, pos = self._model(image_t)
+        # Cast results back to FP32 before downstream numerics so the
+        # denormalisation (* std + mean) stays well-conditioned.
+        logits = logits.float()
+        pos = pos.float()
         keep = torch.sigmoid(logits[0]) >= self.score_threshold
-        return pos[0][keep].float() * self._pos_std_t + self._pos_mean_t
+        return pos[0][keep] * self._pos_std_t + self._pos_mean_t
 
     def _infer_heatmap(self, image_t: torch.Tensor) -> torch.Tensor:
         """HeatmapNavModel forward:
@@ -536,14 +680,23 @@ class OdinNavGraphE2ENode(Node):
           3. Bilinearly sample the 3-D position map at those pixels and
              denormalise.  Returns the (M, 3) device tensor of metric nodes.
         Matches the heatmap repo's validate.py inference path exactly.
+
+        Only the model forward is autocast'd — the F.interpolate +
+        sigmoid below stays in FP32 to keep the heatmap precise for the
+        sampler.
         """
+        use_amp = self._enable_amp_autocast and self._on_cuda
         with torch.no_grad():
-            hm_logits, pos_map, _, _ = self._model(image_t)
+            with torch.amp.autocast(
+                device_type='cuda', dtype=torch.float16, enabled=use_amp,
+            ):
+                hm_logits, pos_map, _, _ = self._model(image_t)
             hm_prob = torch.sigmoid(F.interpolate(
                 hm_logits.float(),
                 size=(self._heatmap_size, self._heatmap_size),
                 mode='bilinear', align_corners=False,
             ))
+            pos_map = pos_map.float()
         # Cache for the per-frame edge builder.
         self._last_hm_prob = hm_prob
         # Sampler returns (x, y) pixel coords in the upsampled heatmap.
@@ -655,8 +808,18 @@ class OdinNavGraphE2ENode(Node):
     # ──────────────────────────────────────────────────
 
     def _process(self, rgb: np.ndarray, odom: Odometry, stamp) -> None:
+        t_frame_start = time.perf_counter()
+
         # 1) Local nodes from the model — model camera frame (x_fwd,y_down,z_left).
+        t0 = time.perf_counter()
         local_cam = self._infer_local_nodes(rgb)  # (M, 3) device tensor
+        # GPU sync so the inference timing reflects the actual GPU work and
+        # not just a kernel-launch return.  Cheap (≈1 cudaEvent) and only
+        # firing on the inference path.
+        if local_cam.is_cuda:
+            torch.cuda.synchronize()
+        t_inference_ms = (time.perf_counter() - t0) * 1000.0
+        n_local_pre = int(local_cam.shape[0])
 
         # 2) camera -> optical -> base_link -> odom.  The 4x4 chain is tiny;
         #    build it on the host, then apply it to all nodes in one matmul.
@@ -674,19 +837,53 @@ class OdinNavGraphE2ENode(Node):
         local_odom = local_cam @ R.T + t  # (M, 3) device tensor
 
         # 3) Merge local nodes into the persistent global graph.
+        t0 = time.perf_counter()
         local_cam_kept, local_ids, n_added = self._merge_local_nodes(
             local_cam, local_odom)
+        if local_odom.is_cuda:
+            torch.cuda.synchronize()
+        t_merge_ms = (time.perf_counter() - t0) * 1000.0
+        n_local_kept = int(local_cam_kept.shape[0])
 
         # 4) Build per-frame edges among the surviving local nodes (heatmap
         #    mode only) and fold them into the global edge set.
+        t0 = time.perf_counter()
         n_new_edges = self._build_edges_for_frame(
             local_cam_kept, local_ids, rgb.shape[:2])
+        t_edges_ms = (time.perf_counter() - t0) * 1000.0
 
         self.get_logger().info(
             f'frame {self.frame_count} local={local_odom.shape[0]} '
             f'added={n_added} global={self.global_nodes.shape[0]} '
             f'edges+={n_new_edges} total_edges={len(self.global_edges)}'
         )
+
+        # ── Per-frame timing CSV row ─────────────────────────────────────
+        if self._timing_csv_writer is not None:
+            t_frame_total_ms = (time.perf_counter() - t_frame_start) * 1000.0
+            core_sum = t_inference_ms + t_merge_ms + t_edges_ms
+            t_other_ms = max(0.0, t_frame_total_ms - core_sum)
+            row = {
+                'frame_index':          int(self.frame_count),
+                'frame_timestamp_sec':  stamp_to_sec(stamp),
+                'num_local_nodes_pre':  n_local_pre,
+                'num_local_nodes_kept': n_local_kept,
+                'num_new_nodes':        int(n_added),
+                'num_nodes':            int(self.global_nodes.shape[0]),
+                'num_edges':            int(len(self.global_edges)),
+                'num_new_edges':        int(n_new_edges),
+                't_inference_ms':       float(t_inference_ms),
+                't_merge_ms':           float(t_merge_ms),
+                't_edges_ms':           float(t_edges_ms),
+                't_other_ms':           float(t_other_ms),
+                't_frame_total_ms':     float(t_frame_total_ms),
+            }
+            try:
+                self._timing_csv_writer.writerow(row)
+            except Exception as exc:
+                self.get_logger().error(
+                    f'timing-csv writerow failed: {exc}', throttle_duration_sec=5.0,
+                )
 
         # 5) Optional periodic pruning: drop nodes that have zero edges.
         if (self._prune_enabled
@@ -1123,6 +1320,90 @@ def _se3_rot(R: np.ndarray) -> np.ndarray:
     return se3
 
 
+# ─────────────────────────────────────────────────────────────────────
+#  Graph-comparison artefacts (e2e side)
+# ─────────────────────────────────────────────────────────────────────
+
+def _save_final_graph_snapshot_e2e(node: 'OdinNavGraphE2ENode') -> None:
+    """Dump the e2e node's current global graph to JSON, schema-compatible
+    with ``nav_graph_node.save_final_graph_snapshot``.
+
+    Node ``type`` is always 1 (free_space) — the e2e pipeline doesn't
+    classify frontiers.  Edge ``weight`` is the Euclidean distance between
+    endpoints in odom, computed at save time (the edge set itself stores
+    only ID pairs).
+    """
+    if node._graph_snapshot_path is None:
+        return
+    try:
+        n = int(node.global_nodes.shape[0])
+        positions = (
+            node.global_nodes.detach().cpu().numpy()
+            if n > 0 else np.empty((0, 3), dtype=np.float32)
+        )
+        ids = (
+            node.global_ids.detach().cpu().numpy()
+            if n > 0 else np.empty((0,), dtype=np.int64)
+        )
+        id_to_idx = {int(ids[i]): i for i in range(n)}
+
+        nodes_out: list = []
+        for i in range(n):
+            nodes_out.append({
+                'id':       int(ids[i]),
+                'type':     1,  # free_space — no frontier classification
+                'position': [
+                    float(positions[i, 0]),
+                    float(positions[i, 1]),
+                    float(positions[i, 2]),
+                ],
+                'scores':   {},
+            })
+
+        edges_out: list = []
+        for pair in node.global_edges:
+            a, b = int(pair[0]), int(pair[1])
+            ia = id_to_idx.get(a, -1)
+            ib = id_to_idx.get(b, -1)
+            if ia < 0 or ib < 0:
+                w = float('nan')  # endpoint pruned but pair lingered
+            else:
+                w = float(np.linalg.norm(positions[ia] - positions[ib]))
+            edges_out.append({'node_id_0': a, 'node_id_1': b, 'weight': w})
+
+        from datetime import datetime, timezone
+        payload = {
+            'method':       'nav_graph_node_e2e',
+            'saved_at_utc': datetime.now(timezone.utc).isoformat(),
+            'frame_count':  int(node.frame_count),
+            'num_nodes':    n,
+            'num_edges':    len(edges_out),
+            'layer_names':  [],
+            'nodes':        nodes_out,
+            'edges':        edges_out,
+        }
+        with open(node._graph_snapshot_path, 'w') as f:
+            json.dump(payload, f, indent=2)
+        node.get_logger().info(
+            f'Final graph snapshot written: {node._graph_snapshot_path} '
+            f'({n} nodes, {len(edges_out)} edges)'
+        )
+    except Exception as exc:
+        import traceback
+        node.get_logger().error(
+            f'save_final_graph_snapshot failed: {exc}\n{traceback.format_exc()}'
+        )
+
+
+def _close_timing_csv_e2e(node: 'OdinNavGraphE2ENode') -> None:
+    try:
+        if node._timing_csv_file is not None and not node._timing_csv_file.closed:
+            node._timing_csv_file.flush()
+            node._timing_csv_file.close()
+    except Exception:
+        pass
+
+
 def main(args=None):
     rclpy.init(args=args)
     node = OdinNavGraphE2ENode()
@@ -1131,12 +1412,23 @@ def main(args=None):
             rclpy.spin(node)
     finally:
         if node.prune_on_shutdown:
-            n_pruned = node._prune_isolated_nodes()
-            node.get_logger().info(
-                f'[prune shutdown] removed {n_pruned} isolated nodes; '
-                f'global={node.global_nodes.shape[0]} '
-                f'edges={len(node.global_edges)}'
-            )
+            try:
+                n_pruned = node._prune_isolated_nodes()
+                node.get_logger().info(
+                    f'[prune shutdown] removed {n_pruned} isolated nodes; '
+                    f'global={node.global_nodes.shape[0]} '
+                    f'edges={len(node.global_edges)}'
+                )
+            except Exception:
+                pass
+        try:
+            _save_final_graph_snapshot_e2e(node)
+        except Exception:
+            pass
+        try:
+            _close_timing_csv_e2e(node)
+        except Exception:
+            pass
         node.destroy_node()
         rclpy.shutdown()
 

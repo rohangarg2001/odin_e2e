@@ -30,7 +30,7 @@ ros2 run odin_nav_graph nav_graph_node_e2e --ros-args \
   -p heatmap_repo_path:=/home/rohang73/ASL/e2e_rgb_nav_graph/heatmap_model \
   -p cam_fx:=800.0 -p cam_fy:=800.0 -p cam_cx:=800.0 -p cam_cy:=648.0 \
   -p max_node_range:=6.0
-  
+
 Heatmap-specific knobs (all optional — ckpt defaults are used otherwise)
 Param	Meaning	Default
 heatmap_sample_threshold	Heatmap probability a pixel must exceed to be eligible for sampling	0.5
@@ -43,6 +43,9 @@ Tune by passing e.g. -p heatmap_sample_min_dist:=8.0 -p heatmap_sample_threshold
 
 
 
+GOOD E2E:
+
+ros2 run odin_nav_graph nav_graph_node_e2e --ros-args   -p model_type:=heatmap   -p heatmap_checkpoint:=/home/rohang73/ASL/e2e_rgb_nav_graph/heatmap_model_training_v5_wall_neg_more_vitb518/best.pth   -p heatmap_repo_path:=/home/rohang73/ASL/e2e_rgb_nav_graph/heatmap_model   -p cam_fx:=800.0 -p cam_fy:=800.0 -p cam_cx:=800.0 -p cam_cy:=648.0   -p max_node_range:=6.0 -p heatmap_sample_min_dist:=8.0 -p heatmap_sample_threshold:=0.6 -p heatmap_sample_window:=9  -p prune_isolated_nodes:=true -p prune_every_n_frames:=300
 
 
 

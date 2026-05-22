@@ -45,8 +45,11 @@ from std_msgs.msg import Header
 from visualization_msgs.msg import Marker
 from geometry_msgs.msg import Point, Pose, Quaternion
 import base64
+import colorsys
 import cv2
 import json
+import queue
+import threading
 from pathlib import Path
 from scipy.spatial.transform import Rotation as _ScipyR
 from scipy.ndimage import binary_dilation
@@ -318,6 +321,40 @@ def _install_builder_patches(builder) -> None:
     gg._update_extended_map = _make_ext_map_fixup(gg, gg._update_extended_map)
 
 
+def _install_builder_timing_patches(builder) -> dict:
+    """Wrap the local-graph generator + global-merge calls to record their
+    per-call durations.  Returns a dict that the caller can read after each
+    ``builder.update(...)``:
+
+      * ``local_ms`` — last ``local_generator.build_graph_from_grid_map`` call.
+      * ``merge_ms`` — last ``global_builder.add_local_graph_gpu`` call.
+
+    Both keys absent until the first wrapped call.  The patch is idempotent —
+    re-applying it would re-stack timings; only call once per builder.
+    """
+    timings: dict = {}
+
+    lg = builder.local_generator
+    orig_build = lg.build_graph_from_grid_map
+    def _timed_build(*args, **kwargs):
+        t0 = time.perf_counter()
+        out = orig_build(*args, **kwargs)
+        timings['local_ms'] = (time.perf_counter() - t0) * 1000.0
+        return out
+    lg.build_graph_from_grid_map = _timed_build
+
+    gg = builder.global_builder
+    orig_merge = gg.add_local_graph_gpu
+    def _timed_merge(*args, **kwargs):
+        t0 = time.perf_counter()
+        out = orig_merge(*args, **kwargs)
+        timings['merge_ms'] = (time.perf_counter() - t0) * 1000.0
+        return out
+    gg.add_local_graph_gpu = _timed_merge
+
+    return timings
+
+
 def _pq_to_se3(translation: np.ndarray, quaternion_xyzw: np.ndarray) -> np.ndarray:
     """4×4 float64 SE3 from translation (3,) and unit quaternion (x,y,z,w)."""
     se3 = np.eye(4, dtype=np.float64)
@@ -330,6 +367,41 @@ def _rgb_to_b64png(rgb: np.ndarray) -> str:
     """Encode an HxWx3 RGB array as a base64-encoded PNG string."""
     _, buf = cv2.imencode('.png', cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
     return base64.b64encode(buf.tobytes()).decode()
+
+
+def _build_rviz_rainbow_lut(n: int = 256) -> np.ndarray:
+    """RViz default intensity colormap, sampled to ``n`` entries.
+
+    Reproduces ``rviz_default_plugins`` ``IntensityPCTransformer`` with
+    "Use rainbow" enabled: h = (1 - v) * 5/6, s = 1, v = 1.  Intensity 0
+    is blue, 1 is red, with the usual cyan/green/yellow stops in between.
+    Returns an (n, 3) float32 array of RGB in [0, 1].
+    """
+    out = np.empty((n, 3), dtype=np.float32)
+    for i, t in enumerate(np.linspace(0.0, 1.0, n)):
+        h = (1.0 - float(t)) * 5.0 / 6.0
+        out[i] = colorsys.hsv_to_rgb(h, 1.0, 1.0)
+    return out
+
+
+_RVIZ_RAINBOW_LUT = _build_rviz_rainbow_lut()
+
+
+def _put_outlined_text(
+    img: np.ndarray,
+    text: str,
+    org: Tuple[int, int],
+    scale: float = 0.5,
+    fg: Tuple[int, int, int] = (255, 255, 255),
+    bg: Tuple[int, int, int] = (0, 0, 0),
+) -> None:
+    """putText with a 3-px black stroke under the foreground glyph.
+
+    The thick black pass acts as an outline so the foreground stays legible
+    against any image background.  Used by the frontier debug legend.
+    """
+    cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, bg, 3, cv2.LINE_AA)
+    cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, fg, 1, cv2.LINE_AA)
 
 
 def _save_svg_plain(path: Path, rgb: np.ndarray) -> None:
@@ -599,15 +671,97 @@ class OdinNavGraphNode(Node):
         self.declare_parameter('explorfm_trav_layer', 'traversability')
         self.declare_parameter('explorfm_frontier_layer', 'frontier_score')
         self.declare_parameter('explorfm_car_detector_layer', 'car')
-        self.declare_parameter('explorfm_tree_detector_layer', 'tree')
-        # Image-space object scoring:
-        #   explorfm_object_std_k     — a pixel counts as a "high car/tree region"
-        #       when its sim exceeds mean + k·std of that frame's sim map.
-        #   explorfm_object_threshold — optional absolute floor on that adaptive
-        #       cutoff (0.0 = floor disabled, pure relative thresholding).
-        #   explorfm_object_uv_radius — a node within this many pixels of a high
-        #       region picks up that region's score.
+        # 3D-distance gating for the car layer: a node within
+        # car_distance_threshold metres of the car's 3D centroid is scored
+        # 1 - d/threshold; nodes outside are forced to 0.  The 3D centroid
+        # is the nearest projected graph node to the centroid pixel of the
+        # car high-sim region.
+        self.declare_parameter('car_distance_threshold', 8.0)
+        # Debug-image saver for the car layer.  Writes a PNG every N image
+        # callbacks with: RGB + projected graph nodes + the high-sim car
+        # region tinted + the centroid pixel marked.  Independent of the
+        # main RGB+graph saver (which is gated by save_frame_start/end).
+        self.declare_parameter('car_debug_save_every_n', 10000)
+        self.declare_parameter(
+            'car_debug_dir',
+            '/home/rohang73/Documents/odin_e2e/car_layer_degub_images',
+        )
+        # Optional parallel PNG output — same rendered frame, PNG alongside
+        # the PDF.  The PDF is the canonical archive; PNG is for quick
+        # previews / video stitching.  Empty string disables.
+        self.declare_parameter(
+            'car_debug_png_dir',
+            '/home/rohang73/Documents/odin_e2e/car_layer_degub_images_png',
+        )
+        # Debug-image saver for the frontier_score layer.  Same async PDF
+        # pipeline as the car saver — writes RGB + per-pixel ExploRFM
+        # frontier heatmap overlay + visible frontier nodes coloured by
+        # the persistent frontier_score layer (matches the on-screen
+        # /frontier_score_cloud's RViz rainbow + autobounds).
+        self.declare_parameter('frontier_debug_save_every_n', 10000)
+        self.declare_parameter(
+            'frontier_debug_dir',
+            '/home/rohang73/Documents/odin_e2e/frontier_layer_debug_images',
+        )
+        self.declare_parameter(
+            'frontier_debug_png_dir',
+            '/home/rohang73/Documents/odin_e2e/frontier_layer_debug_images_png',
+        )
+        # Heatmap-overlay threshold for the frontier debug image.  Only
+        # pixels with front_map > mean + k·std are colored — everything
+        # else stays as the raw RGB.  Higher k → smaller, brighter patches.
+        self.declare_parameter('frontier_debug_high_std_k', 2.5)
+        # Whether to overlay graph edges (white lines between connected
+        # visible nodes) in the car / frontier debug images.  Off by
+        # default — set true to inspect graph connectivity in-frame.
+        self.declare_parameter('debug_image_draw_edges', False)
+
+        # ── Graph-comparison artefacts ───────────────────────────────────
+        # Written into the same directory the comparison script reads.  The
+        # JSON is the final-state graph snapshot (called from main() on
+        # Ctrl-C or normal exit); the CSV is a per-frame timing breakdown
+        # of the core graph computation, appended every cloud_callback.
+        self.declare_parameter(
+            'graph_snapshot_path',
+            '/home/rohang73/Documents/odin_e2e/graph_compaRISION/inputs/nav_graph_node.json',
+        )
+        self.declare_parameter(
+            'timing_csv_path',
+            '/home/rohang73/Documents/odin_e2e/graph_compaRISION/inputs/nav_graph_node_timing.csv',
+        )
+        self.declare_parameter('enable_graph_snapshot_save', True)
+        self.declare_parameter('enable_timing_csv', True)
+
+        # Image-space car detection.  A pixel is "high-sim car" iff it passes
+        # BOTH thresholds — the adaptive one is necessary (the loudest tail
+        # always exists) but not sufficient on no-car frames, so the absolute
+        # floor catches frames where the loudest tail still has low cosine
+        # similarity overall.
+        #   explorfm_object_std_k        — adaptive: sim > mean + k·std of
+        #       this frame's sim map.  Higher k → fewer high pixels per frame.
+        #   car_absolute_sim_threshold   — absolute floor on the cosine
+        #       similarity itself.  Set above the typical no-car ``sim_max``
+        #       you see in the log to suppress phantom detections (e.g. 0.15
+        #       or 0.20 for SigLIP2 raw cosine sim; tune from the per-frame
+        #       sim_max printed in the [explorfm rgb=…] log line).  0.0 →
+        #       absolute floor disabled, only the adaptive cutoff applies.
+        #   car_min_high_pixels          — final guardrail: if fewer than
+        #       this many pixels survive both thresholds, the detection is
+        #       treated as noise (no centroid, all car scores → 0).
+        #   car_max_centroid_node_pixel_distance — the nearest projected
+        #       graph node to the car centroid must be within this many
+        #       pixels.  If no node is that close, the centroid has no
+        #       trustworthy depth anchor and the detection is dropped (all
+        #       node scores → 0).  Set <= 0 to disable the check.
+        #   explorfm_object_threshold    — legacy floor; folded into the same
+        #       check as car_absolute_sim_threshold via max(). Kept for
+        #       backward compatibility with existing launch configs.
+        #   explorfm_object_uv_radius    — deprecated, no longer used (car
+        #       scores are now driven by 3D distance, not pixel dilation).
         self.declare_parameter('explorfm_object_std_k', 3.0)
+        self.declare_parameter('car_absolute_sim_threshold', 0.1)
+        self.declare_parameter('car_min_high_pixels', 15)
+        self.declare_parameter('car_max_centroid_node_pixel_distance', 70.0)
         self.declare_parameter('explorfm_object_threshold', 0.0)
         self.declare_parameter('explorfm_object_uv_radius', 25)
 
@@ -619,7 +773,7 @@ class OdinNavGraphNode(Node):
         self.declare_parameter('enable_path_proximity_layer', True)
         self.declare_parameter('path_proximity_layer', 'path_proximity')
 
-        # Per-node proximity falloff for the car / tree / path layers.
+        # Per-node proximity falloff for the path layer.
         # score = 1 / (1 + falloff * distance_to_nearest_source) → 1 on top of a
         # source, decaying with distance.  0.5 ⇒ score ≈ 0.5 at 2 m away.
         self.declare_parameter('layer_proximity_falloff', 0.5)
@@ -660,7 +814,7 @@ class OdinNavGraphNode(Node):
             global_merge_distance=float(gp('global_merge_distance')),
             global_max_candidate_edge_distance=float(gp('global_max_candidate_edge_distance')),
             global_max_candidate_edge_search_distance = 100,
-            global_max_connections = 13,
+            global_max_connections = 10,
             elevation_min_filter_radius=self._z_lookup_min_filter_radius_cells,
             frontier=FrontierConfig(
                 kernel_size=int(gp('frontier_kernel_size')),
@@ -670,7 +824,7 @@ class OdinNavGraphNode(Node):
                 minimum_points_in_cluster=int(gp('minimum_points_in_cluster')),
                 min_free_fraction=float(gp('frontier_min_free_fraction')),
                 min_unknown_fraction=float(gp('frontier_min_unknown_fraction')),
-                angular_gap_min_gap_deg = 120.0,
+                angular_gap_min_gap_deg = 100.0,
             ),
             elevation_map=ElevationMapConfig(
                 gaussian_sigma=float(gp('elev_gaussian_sigma')),
@@ -685,6 +839,9 @@ class OdinNavGraphNode(Node):
         self.builder = NavigationGraphBuilder(cfg)
         # Real-world robustness wrappers (per-node Z is handled in-core now).
         _install_builder_patches(self.builder)
+        # Sub-step timings (local-graph + global-merge) for the comparison
+        # CSV — wraps the same builder before any other patches stack on top.
+        self._builder_timings: dict = _install_builder_timing_patches(self.builder)
         self._trav_median_filter_size = int(gp('trav_median_filter_size'))
         self._trav_obstacle_dilate_iters = int(gp('trav_obstacle_dilate_iters'))
         self._trav_unknown_dilate_iters = int(gp('trav_unknown_dilate_iters'))
@@ -765,12 +922,10 @@ class OdinNavGraphNode(Node):
         self.edges_pub = self.create_publisher(Marker, '~/graph_edges', 1)
         # Layer visualisation clouds — intensity in [0,1], colour with RViz intensity colormap.
         #   ~/frontier_score_cloud  — frontier nodes, ExploRFM frontier score.
-        #   ~/car_layer             — all nodes, closeness to a detected car.
-        #   ~/tree_layer            — all nodes, closeness to a detected tree.
+        #   ~/car_layer             — all nodes, 3D closeness to a detected car.
         #   ~/path_proximity_layer  — all nodes, closeness to the robot path.
         self.frontier_score_pub = self.create_publisher(PointCloud2, '~/frontier_score_cloud', 1)
         self.car_layer_pub = self.create_publisher(PointCloud2, '~/car_layer', 1)
-        self.tree_layer_pub = self.create_publisher(PointCloud2, '~/tree_layer', 1)
         self.path_prox_pub = self.create_publisher(PointCloud2, '~/path_proximity_layer', 1)
         # Extended global occupancy grid used for edge collision checking inside GlobalGraphGenerator.
         self.global_occ_pub = self.create_publisher(OccupancyGrid, '~/global_occ_grid', 1)
@@ -820,15 +975,93 @@ class OdinNavGraphNode(Node):
         self._trav_layer_name = str(gp('explorfm_trav_layer'))
         self._front_layer_name = str(gp('explorfm_frontier_layer'))
         self._car_layer_name = str(gp('explorfm_car_detector_layer'))
-        self._tree_layer_name = str(gp('explorfm_tree_detector_layer'))
         self._object_threshold = float(gp('explorfm_object_threshold'))
         self._object_std_k = float(gp('explorfm_object_std_k'))
-        self._object_uv_radius = max(0, int(gp('explorfm_object_uv_radius')))
-        # Order matters — must match self._object_layer_names below.
-        self.object_queries = ['car', 'tree']
-        self._object_layer_names = [self._car_layer_name, self._tree_layer_name]
+        self._car_abs_sim_threshold = float(gp('car_absolute_sim_threshold'))
+        self._car_min_high_pixels = max(0, int(gp('car_min_high_pixels')))
+        self._car_max_centroid_node_px = float(gp('car_max_centroid_node_pixel_distance'))
+        self._car_distance_threshold = float(gp('car_distance_threshold'))
+        # Only one object query now — kept as a list so the SigLIP2 forward
+        # path (which expects a list of prompts and returns (Q, D) features)
+        # is unchanged.
+        self.object_queries = ['car']
         # Cached text embeddings for self.object_queries (set in _init_explorfm).
         self._object_text_emb: Optional[torch.Tensor] = None
+
+        # Car-layer debug image saver — runs on a background thread so the
+        # PDF render doesn't block the ROS executor (which would starve the
+        # cloud callback and stop /graph_nodes from publishing).  The queue
+        # is bounded with a drop-oldest policy so a slow worker can never
+        # backlog memory or hold up the producer.
+        self._car_debug_every_n = max(1, int(gp('car_debug_save_every_n')))
+        car_debug_dir_str = str(gp('car_debug_dir')).strip()
+        self._car_debug_dir: Optional[Path] = (
+            Path(car_debug_dir_str) if car_debug_dir_str else None
+        )
+        car_debug_png_str = str(gp('car_debug_png_dir')).strip()
+        self._car_debug_png_dir: Optional[Path] = (
+            Path(car_debug_png_str) if car_debug_png_str else None
+        )
+        if self._car_debug_png_dir is not None:
+            self._car_debug_png_dir.mkdir(parents=True, exist_ok=True)
+        if self._car_debug_dir is not None:
+            self._car_debug_dir.mkdir(parents=True, exist_ok=True)
+        self._car_debug_queue: Optional[queue.Queue] = None
+        self._car_debug_thread: Optional[threading.Thread] = None
+        if self._car_debug_dir is not None or self._car_debug_png_dir is not None:
+            self._car_debug_queue = queue.Queue(maxsize=8)
+            self._car_debug_thread = threading.Thread(
+                target=self._car_debug_worker,
+                name='CarDebugSaver',
+                daemon=True,
+            )
+            self._car_debug_thread.start()
+            self.get_logger().info(
+                f'Car-layer debug images → '
+                f'PDF={self._car_debug_dir or "off"}, '
+                f'PNG={self._car_debug_png_dir or "off"} '
+                f'(every {self._car_debug_every_n} image frames, '
+                f'async worker, queue max=8)'
+            )
+
+        # Frontier-layer debug saver — same async PDF pipeline as the car
+        # saver, just feeding a different layer and adding a per-pixel
+        # ExploRFM frontier-score heatmap overlay so you can see what the
+        # model considers visually important.
+        self._frontier_debug_every_n = max(1, int(gp('frontier_debug_save_every_n')))
+        self._frontier_debug_high_std_k = float(gp('frontier_debug_high_std_k'))
+        self._debug_image_draw_edges = bool(gp('debug_image_draw_edges'))
+        frontier_debug_dir_str = str(gp('frontier_debug_dir')).strip()
+        self._frontier_debug_dir: Optional[Path] = (
+            Path(frontier_debug_dir_str) if frontier_debug_dir_str else None
+        )
+        frontier_debug_png_str = str(gp('frontier_debug_png_dir')).strip()
+        self._frontier_debug_png_dir: Optional[Path] = (
+            Path(frontier_debug_png_str) if frontier_debug_png_str else None
+        )
+        if self._frontier_debug_png_dir is not None:
+            self._frontier_debug_png_dir.mkdir(parents=True, exist_ok=True)
+        if self._frontier_debug_dir is not None:
+            self._frontier_debug_dir.mkdir(parents=True, exist_ok=True)
+        self._frontier_debug_queue: Optional[queue.Queue] = None
+        self._frontier_debug_thread: Optional[threading.Thread] = None
+        if (self._frontier_debug_dir is not None
+                or self._frontier_debug_png_dir is not None):
+            self._frontier_debug_queue = queue.Queue(maxsize=8)
+            self._frontier_debug_thread = threading.Thread(
+                target=self._frontier_debug_worker,
+                name='FrontierDebugSaver',
+                daemon=True,
+            )
+            self._frontier_debug_thread.start()
+            self.get_logger().info(
+                f'Frontier-layer debug images → '
+                f'PDF={self._frontier_debug_dir or "off"}, '
+                f'PNG={self._frontier_debug_png_dir or "off"} '
+                f'(every {self._frontier_debug_every_n} image frames, '
+                f'async worker, queue max=8)'
+            )
+
         if bool(gp('enable_explorfm_layers')):
             self._init_explorfm(gp)
 
@@ -849,6 +1082,42 @@ class OdinNavGraphNode(Node):
             f'Ready | cloud={cloud_topic} odom={odom_topic} '
             f'map={W}x{H}@{res:.3f}m frame={self.frame_id}'
         )
+
+        # ── Graph-comparison artefacts: final-snapshot path + timing CSV ──
+        self._save_snapshot_enabled = bool(gp('enable_graph_snapshot_save'))
+        self._graph_snapshot_path: Optional[Path] = (
+            Path(str(gp('graph_snapshot_path'))).expanduser()
+            if self._save_snapshot_enabled and str(gp('graph_snapshot_path')).strip()
+            else None
+        )
+        if self._graph_snapshot_path is not None:
+            self._graph_snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            self.get_logger().info(
+                f'Final-graph snapshot will write to {self._graph_snapshot_path}'
+            )
+        self._timing_csv_writer = None
+        self._timing_csv_file = None
+        self._timing_csv_cols = [
+            'frame_index', 'frame_timestamp_sec',
+            'num_input_points', 'num_valid_cells',
+            'num_nodes', 'num_edges', 'num_frontiers',
+            't_parse_ms', 't_emap_ms',
+            't_local_ms', 't_merge_ms', 't_other_ms', 't_graph_total_ms',
+            't_frame_total_ms',
+        ]
+        if bool(gp('enable_timing_csv')):
+            csv_path_str = str(gp('timing_csv_path')).strip()
+            if csv_path_str:
+                import csv as _csv
+                csv_path = Path(csv_path_str).expanduser()
+                csv_path.parent.mkdir(parents=True, exist_ok=True)
+                # Line-buffered so the file is durable across Ctrl-C / crashes.
+                self._timing_csv_file = open(csv_path, 'w', newline='', buffering=1)
+                self._timing_csv_writer = _csv.DictWriter(
+                    self._timing_csv_file, fieldnames=self._timing_csv_cols,
+                )
+                self._timing_csv_writer.writeheader()
+                self.get_logger().info(f'Per-frame timing CSV → {csv_path}')
 
     # ──────────────────────────────────────────────────
     #  Callbacks
@@ -924,6 +1193,7 @@ class OdinNavGraphNode(Node):
     # ──────────────────────────────────────────────────
 
     def _process(self, msg: PointCloud2, odom: Odometry) -> None:
+        t_frame_start = time.perf_counter()
         # Pose: world (odom) <- base_link.  Apply to base-frame points.
         p = odom.pose.pose.position
         q = odom.pose.pose.orientation
@@ -1032,6 +1302,40 @@ class OdinNavGraphNode(Node):
             f'nodes={result.num_nodes} frontiers={n_frontiers} edges={result.num_edges}'
         )
 
+        # ── Per-frame timing CSV row.  Sub-step timings come from the
+        # builder-internal patches installed in __init__.  ``t_other_ms`` is
+        # whatever's left of t_graph after the two main steps — frontier
+        # detection, clustering, marking, layer compute, result extract.
+        if self._timing_csv_writer is not None:
+            t_local_ms = float(self._builder_timings.get('local_ms', float('nan')))
+            t_merge_ms = float(self._builder_timings.get('merge_ms', float('nan')))
+            t_other_ms = float('nan')
+            if math.isfinite(t_local_ms) and math.isfinite(t_merge_ms):
+                t_other_ms = max(0.0, t_graph - t_local_ms - t_merge_ms)
+            t_frame_total_ms = (time.perf_counter() - t_frame_start) * 1000.0
+            row = {
+                'frame_index':         int(self.frame_count),
+                'frame_timestamp_sec': stamp_to_sec(msg.header.stamp),
+                'num_input_points':    int(xyz_base.shape[0]),
+                'num_valid_cells':     n_valid_cells,
+                'num_nodes':           int(result.num_nodes),
+                'num_edges':           int(result.num_edges),
+                'num_frontiers':       n_frontiers,
+                't_parse_ms':          float(t_parse),
+                't_emap_ms':           float(t_emap),
+                't_local_ms':          t_local_ms,
+                't_merge_ms':          t_merge_ms,
+                't_other_ms':          t_other_ms,
+                't_graph_total_ms':    float(t_graph),
+                't_frame_total_ms':    float(t_frame_total_ms),
+            }
+            try:
+                self._timing_csv_writer.writerow(row)
+            except Exception as exc:
+                self.get_logger().error(
+                    f'timing-csv writerow failed: {exc}', throttle_duration_sec=5.0,
+                )
+
         # Safety throttle: if the graph runs away (typically because of
         # a frame/convention bug), reset the global graph so we don't
         # crash RViz with multi-million-point clouds.
@@ -1044,6 +1348,7 @@ class OdinNavGraphNode(Node):
             )
             self.builder.reset()
             _install_builder_patches(self.builder)
+            self._builder_timings = _install_builder_timing_patches(self.builder)
             _make_traversability_smoother(self.builder, self._trav_median_filter_size)
             _make_obstacle_unknown_dilator(
                 self.builder,
@@ -1257,11 +1562,10 @@ class OdinNavGraphNode(Node):
         """Publish the per-layer visualisation clouds.
 
         ~/frontier_score_cloud  — frontier nodes, ExploRFM frontier score.
-        ~/car_layer             — all nodes, per-frame car score (ExploRFM).
-        ~/tree_layer            — all nodes, per-frame tree score (ExploRFM).
+        ~/car_layer             — all nodes, 3D closeness to the per-frame car centroid.
         ~/path_proximity_layer  — all nodes, closeness to the robot path.
 
-        Car/tree/path scores are produced upstream (ExploRFM ingest and the
+        Car/path scores are produced upstream (ExploRFM ingest and the
         path-proximity ComputeLayer) — here we just read the columns out of
         ``result.node_scores`` and pack them into clouds.
         """
@@ -1287,15 +1591,13 @@ class OdinNavGraphNode(Node):
                 self._make_xyz_intensity_cloud(pos_np[fm_np], fscore, stamp),
             )
 
-        # ── car / tree layers — read the ingested score column directly ──────
-        for layer_name, pub in (
-            (self._car_layer_name, self.car_layer_pub),
-            (self._tree_layer_name, self.tree_layer_pub),
-        ):
-            if scores is not None and layer_name in names:
-                col = names.index(layer_name)
-                vals = scores[:, col].detach().cpu().float().numpy()
-                pub.publish(self._make_xyz_intensity_cloud(pos_np, vals, stamp))
+        # ── car layer — read the ingested score column directly ─────────────
+        if scores is not None and self._car_layer_name in names:
+            col = names.index(self._car_layer_name)
+            vals = scores[:, col].detach().cpu().float().numpy()
+            self.car_layer_pub.publish(
+                self._make_xyz_intensity_cloud(pos_np, vals, stamp),
+            )
 
         # ── path-proximity layer — read straight from the registered layer ──
         if (self.path_proximity_layer is not None and scores is not None
@@ -1426,17 +1728,23 @@ class OdinNavGraphNode(Node):
             ExternalLayer(self._front_layer_name, ingest_policy=MergePolicy.REPLACE),
             weight=0.0,
         )
+        # Car layer uses a CUSTOM max merge so colours stick — once a node
+        # has been painted by a nearby car, it keeps that score (or gets
+        # brighter if the robot later passes even closer).  Combined with
+        # the subset-only ingest in `_infer_and_ingest` (we only ingest IDs
+        # whose new score > 0), distant / no-detection frames leave the
+        # existing colours alone instead of resetting them.
         self.builder.add_layer(
-            ExternalLayer(self._car_layer_name, ingest_policy=MergePolicy.REPLACE),
-            weight=0.0
-        )
-        self.builder.add_layer(
-            ExternalLayer(self._tree_layer_name, ingest_policy=MergePolicy.REPLACE),
-            weight=0.0
+            ExternalLayer(
+                self._car_layer_name,
+                ingest_policy=MergePolicy.CUSTOM,
+                custom_ingest_fn=lambda old, new: torch.maximum(old, new),
+            ),
+            weight=0.0,
         )
         self.get_logger().info(
             f'ExploRFM ready. Layers registered: '
-            f'{self._trav_layer_name!r}, {self._front_layer_name!r}, {self._car_layer_name}, {self._tree_layer_name} '
+            f'{self._trav_layer_name!r}, {self._front_layer_name!r}, {self._car_layer_name} '
             f'(weight=0.0 — ingest-only; raise via set_layer_weight to feed combined score).'
         )
 
@@ -1454,7 +1762,7 @@ class OdinNavGraphNode(Node):
         except Exception as exc:
             self.get_logger().error(
                 f'Failed to encode object queries {self.object_queries}: {exc}; '
-                'car/tree layers will stay empty.'
+                'car layer will stay empty.'
             )
             self._object_text_emb = None
 
@@ -1484,7 +1792,18 @@ class OdinNavGraphNode(Node):
             and self._save_frame_start <= self._rgb_count <= self._save_frame_end
             and (self._rgb_count - self._save_frame_start) % self._save_every_n == 0
         )
-        if not (do_infer or in_save_window):
+        do_car_debug = (
+            (self._car_debug_dir is not None or self._car_debug_png_dir is not None)
+            and self._explorfm is not None
+            and (self._rgb_count % self._car_debug_every_n == 0)
+        )
+        do_frontier_debug = (
+            (self._frontier_debug_dir is not None
+             or self._frontier_debug_png_dir is not None)
+            and self._explorfm is not None
+            and (self._rgb_count % self._frontier_debug_every_n == 0)
+        )
+        if not (do_infer or in_save_window or do_car_debug or do_frontier_debug):
             return
 
         if not self._cam_frame:
@@ -1513,9 +1832,13 @@ class OdinNavGraphNode(Node):
         # Per-node values produced by the model (same length/order as proj['visible_nodes']).
         trav_per_node: Optional[np.ndarray] = None
         front_per_node: Optional[np.ndarray] = None
+        car_debug: Optional[dict] = None
+        frontier_debug: Optional[dict] = None
         if do_infer:
             try:
-                trav_per_node, front_per_node = self._infer_and_ingest(rgb, proj)
+                trav_per_node, front_per_node, car_debug, frontier_debug = (
+                    self._infer_and_ingest(rgb, proj)
+                )
             except Exception as exc:  # pragma: no cover  - defensive
                 import traceback
                 self.get_logger().error(
@@ -1532,6 +1855,26 @@ class OdinNavGraphNode(Node):
                 import traceback
                 self.get_logger().error(
                     f'_save_frame_files failed: {exc}\n{traceback.format_exc()}'
+                )
+
+        if do_car_debug:
+            try:
+                self._enqueue_car_debug_save(rgb, proj, car_debug, self._rgb_count)
+            except Exception as exc:
+                import traceback
+                self.get_logger().error(
+                    f'enqueue car-debug save failed: {exc}\n{traceback.format_exc()}'
+                )
+
+        if do_frontier_debug:
+            try:
+                self._enqueue_frontier_debug_save(
+                    rgb, proj, frontier_debug, self._rgb_count,
+                )
+            except Exception as exc:
+                import traceback
+                self.get_logger().error(
+                    f'enqueue frontier-debug save failed: {exc}\n{traceback.format_exc()}'
                 )
 
     def _decode_image(self, msg: Image) -> Optional[np.ndarray]:
@@ -1598,6 +1941,7 @@ class OdinNavGraphNode(Node):
         front = pos_opt[:, 2] > 0.1
         pos_opt_f = pos_opt[front]
         pos_cam_f = pos_cam[front]
+        pos_odom_f = pos_odom[front]
         types_f = node_types[front]
         ids_f = node_ids[front]
 
@@ -1606,6 +1950,7 @@ class OdinNavGraphNode(Node):
         u_in = np.empty(0, dtype=np.int64)
         v_in = np.empty(0, dtype=np.int64)
         pos_cam_in = np.empty((0, 3), dtype=np.float64)
+        pos_odom_in = np.empty((0, 3), dtype=np.float64)
         types_in = np.empty(0, dtype=node_types.dtype)
         ids_in = np.empty(0, dtype=node_ids.dtype)
 
@@ -1617,6 +1962,7 @@ class OdinNavGraphNode(Node):
             u_in = u_all[inside].astype(np.int64)
             v_in = v_all[inside].astype(np.int64)
             pos_cam_in = pos_cam_f[inside]
+            pos_odom_in = pos_odom_f[inside]
             types_in = types_f[inside]
             ids_in = ids_f[inside]
 
@@ -1633,37 +1979,59 @@ class OdinNavGraphNode(Node):
 
         visible_id_set = {n['id'] for n in visible_nodes}
         visible_edges: list = []
+        # Parallel (E, 4) int32 array of [u0, v0, u1, v1] endpoint pixels —
+        # cheaper to push through worker queues than a list of dicts and
+        # ready for direct cv2.line drawing in the debug renderers.
+        edge_uvs_list: list = []
         if result.num_edges > 0:
+            id_to_uv = {
+                int(ids_in[i]): (int(u_in[i]), int(v_in[i]))
+                for i in range(len(ids_in))
+            }
             edge_arr = result.edge_index.cpu().numpy()
             for e in edge_arr:
                 id0, id1 = int(e[0]), int(e[1])
                 if id0 in visible_id_set and id1 in visible_id_set:
                     visible_edges.append({'node_id_0': id0, 'node_id_1': id1})
+                    u0, v0 = id_to_uv[id0]
+                    u1, v1 = id_to_uv[id1]
+                    edge_uvs_list.append((u0, v0, u1, v1))
+        edge_uvs = (
+            np.array(edge_uvs_list, dtype=np.int32)
+            if edge_uvs_list else np.empty((0, 4), dtype=np.int32)
+        )
 
         return {
-            'visible_nodes': visible_nodes,
-            'visible_edges': visible_edges,
-            'visible_ids':   ids_in.astype(np.int64),
-            'visible_types': types_in.astype(np.int64),
-            'visible_u':     u_in,
-            'visible_v':     v_in,
-            'T_opt_from_odom': T_opt_from_odom,
+            'visible_nodes':    visible_nodes,
+            'visible_edges':    visible_edges,
+            'visible_edge_uv':  edge_uvs,
+            'visible_ids':      ids_in.astype(np.int64),
+            'visible_types':    types_in.astype(np.int64),
+            'visible_u':        u_in,
+            'visible_v':        v_in,
+            'visible_pos_odom': pos_odom_in.astype(np.float64),
+            'T_opt_from_odom':  T_opt_from_odom,
         }
 
     def _infer_and_ingest(
         self,
         rgb: np.ndarray,
         proj: dict,
-    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], dict, dict]:
         """Run ExploRFM, sample at projected pixels, ingest into layers.
 
-        Returns ``(trav_per_node, front_per_node)`` aligned with
-        ``proj['visible_nodes']``.  ``front_per_node`` is NaN for non-frontier
-        rows (they are not ingested into the frontier layer).
+        Returns ``(trav_per_node, front_per_node, car_debug, frontier_debug)``:
+
+          * ``trav_per_node``    — aligned with ``proj['visible_nodes']``.
+          * ``front_per_node``   — same, NaN for non-frontier rows.
+          * ``car_debug``        — info the car-debug saver needs (high-sim
+            mask, centroid pixel, picked-node pixel, 3D centroid position).
+          * ``frontier_debug``   — info the frontier-debug saver needs: the
+            per-pixel frontier-score heatmap (``front_map_np``) plus its
+            min/max.
         """
         ids_np = proj['visible_ids']
-        if ids_np.size == 0:
-            return None, None
+        device = self.builder.global_builder._global_pos.device
 
         t0 = time.perf_counter()
         trav_t, front_t, ad_feats_t = self._explorfm.forward_on_numpy(rgb)
@@ -1672,78 +2040,176 @@ class OdinNavGraphNode(Node):
         front_np = front_t[0, 0].detach().float().cpu().numpy()
         infer_ms = (time.perf_counter() - t0) * 1000.0
 
+        # Frontier debug payload is just the per-pixel score map — the
+        # saver normalises it itself.  Kept as float32 to save bandwidth
+        # across the worker queue.
+        frontier_debug: dict = {
+            'front_map_np': front_np.astype(np.float32, copy=False),
+            'front_min':    float(front_np.min()) if front_np.size else 0.0,
+            'front_max':    float(front_np.max()) if front_np.size else 1.0,
+        }
+
         h, w = trav_np.shape
-        u = np.clip(proj['visible_u'], 0, w - 1)
-        v = np.clip(proj['visible_v'], 0, h - 1)
-        trav_vals = trav_np[v, u].astype(np.float32)
 
-        types_np = proj['visible_types']
-        front_mask = types_np == 2
-        front_vals_full = np.full(ids_np.shape, np.nan, dtype=np.float32)
-        if front_mask.any():
-            front_vals_full[front_mask] = front_np[v[front_mask], u[front_mask]].astype(np.float32)
+        # ── Traversability + frontier-score sampling (needs visible nodes) ──
+        trav_vals: Optional[np.ndarray] = None
+        front_vals_full: Optional[np.ndarray] = None
+        n_front = 0
+        if ids_np.size > 0:
+            u = np.clip(proj['visible_u'], 0, w - 1)
+            v = np.clip(proj['visible_v'], 0, h - 1)
+            trav_vals = trav_np[v, u].astype(np.float32)
 
-        device = self.builder.global_builder._global_pos.device
-        # ids_t = torch.from_numpy(ids_np).to(device=device, dtype=torch.long)
-        # trav_vals_t = torch.from_numpy(trav_vals).to(device=device, dtype=torch.float32)
-        # Traversability layer disabled.
-        # self.builder.ingest_layer_scores(self._trav_layer_name, ids_t, trav_vals_t)
+            types_np = proj['visible_types']
+            front_mask = types_np == 2
+            front_vals_full = np.full(ids_np.shape, np.nan, dtype=np.float32)
+            if front_mask.any():
+                front_vals_full[front_mask] = front_np[
+                    v[front_mask], u[front_mask],
+                ].astype(np.float32)
 
-        n_front = int(front_mask.sum())
-        if n_front > 0:
-            front_ids_t = torch.from_numpy(ids_np[front_mask]).to(device=device, dtype=torch.long)
-            front_vals_t = torch.from_numpy(front_vals_full[front_mask]).to(
-                device=device, dtype=torch.float32,
-            )
-            self.builder.ingest_layer_scores(self._front_layer_name, front_ids_t, front_vals_t)
+            n_front = int(front_mask.sum())
+            if n_front > 0:
+                front_ids_t = torch.from_numpy(ids_np[front_mask]).to(
+                    device=device, dtype=torch.long,
+                )
+                front_vals_t = torch.from_numpy(front_vals_full[front_mask]).to(
+                    device=device, dtype=torch.float32,
+                )
+                self.builder.ingest_layer_scores(
+                    self._front_layer_name, front_ids_t, front_vals_t,
+                )
 
-        # Per-node object scoring (car / tree) in image space.
-        #   1. SigLIP2 text-patch cosine similarity → per-pixel car/tree heatmap.
-        #   2. Keep only "high" pixels (sim > threshold); zero the rest.
-        #   3. Dilate by the UV radius (max-pool) so a node within `radius` px of
-        #      a high region inherits that region's score.
-        #   4. Sample the dilated map at every visible node's pixel.
-        #   5. Normalise per frame (÷ per-frame max) and ingest into car/tree.
-        # All of steps 1-3 run on the GPU.
+        # ── Car layer: 3D-distance gating from the car centroid pixel ──────
+        # Pipeline (per frame):
+        #   1. SigLIP2 text-patch cosine similarity → per-pixel car heatmap.
+        #   2. Adaptive threshold (mean + k·std, clamped above an optional
+        #      absolute floor) → binary high-sim mask.
+        #   3. Pixel centroid of the high-sim mask = the car's image-space
+        #      centre.  Find the visible projected graph node closest to
+        #      that pixel and take its 3D odom position as the car's 3D
+        #      centroid (cheap depth substitute — no extra ray-casting).
+        #   4. For each graph node within `car_distance_threshold` of the
+        #      3D centroid, score = 1 - d / threshold (always > 0).  Ingest
+        #      only that subset.  The car layer's CUSTOM merge takes the
+        #      elementwise max with the previously-stored score, so painted
+        #      nodes keep their brightest-ever colour — driving past, then
+        #      away, doesn't erase them.  Nodes never seen near a car stay
+        #      at the layer's default 0.
+        # If no car pixels survive thresholding, no node is close enough in
+        # image space to anchor the centroid, or no node is within the 3D
+        # range, the frame is a no-op and previous colours persist.
+        car_debug: dict = {
+            'high_mask':       None,   # (H, W) bool np
+            'centroid_uv':     None,   # (cu, cv) float tuple or None
+            'nearest_node_uv': None,   # (u, v) float tuple or None
+            'car_xyz_odom':   None,    # (3,) np.float64 or None
+            'n_high_pixels':   0,
+            'sim_max':         float('nan'),
+            'thr':             float('nan'),
+        }
         obj_hits_log = ''
         if self._object_text_emb is not None:
-            patch = F.normalize(ad_feats_t.float(), dim=1)                        # (1, D, h, w)
-            sim = torch.einsum('nd,bdhw->bnhw', self._object_text_emb, patch)     # (1, Q, h, w)
+            patch = F.normalize(ad_feats_t.float(), dim=1)                       # (1, D, h, w)
+            sim = torch.einsum('nd,bdhw->bnhw', self._object_text_emb, patch)    # (1, 1, h, w)
             sim_full = F.interpolate(
                 sim, size=rgb.shape[:2], mode='bilinear', align_corners=False,
-            )                                                                     # (1, Q, H, W)
-            # "High region" = per-frame, per-query adaptive threshold:
-            # mean + k·std of that query's sim map (raw SigLIP2 cosine values
-            # are uncalibrated and differ per query, so an absolute cutoff
-            # cannot serve both car and tree).  An optional absolute floor
-            # (explorfm_object_threshold) clamps it from below.
-            q_mean = sim_full.mean(dim=(2, 3), keepdim=True)                     # (1, Q, 1, 1)
-            q_std = sim_full.std(dim=(2, 3), keepdim=True)                       # (1, Q, 1, 1)
-            thr = torch.clamp(
-                q_mean + self._object_std_k * q_std, min=self._object_threshold,
-            )
-            high = sim_full * (sim_full > thr).float()
-            r = self._object_uv_radius
-            dilated = F.max_pool2d(high, kernel_size=2 * r + 1, stride=1, padding=r)
-            dilated_np = dilated[0].detach().float().cpu().numpy()                # (Q, H, W)
-            sim_max = sim_full[0].amax(dim=(1, 2)).detach().cpu().numpy()         # (Q,)
-            thr_np = thr[0, :, 0, 0].detach().cpu().numpy()                       # (Q,)
+            )                                                                    # (1, 1, H, W)
+            q_mean = sim_full.mean(dim=(2, 3), keepdim=True)
+            q_std = sim_full.std(dim=(2, 3), keepdim=True)
+            # Adaptive cutoff (per-frame): sim > mean + k·std.
+            adaptive_thr = q_mean + self._object_std_k * q_std
+            # Absolute floor: sim > max(car_absolute_sim_threshold, legacy
+            # explorfm_object_threshold).  Folding via max() means the
+            # effective per-pixel threshold is the elementwise max of the
+            # adaptive cutoff and the absolute floor — equivalent to
+            # requiring sim to beat BOTH thresholds.
+            abs_floor = max(self._car_abs_sim_threshold, self._object_threshold)
+            thr = torch.clamp(adaptive_thr, min=abs_floor)
+            high_mask_np = (sim_full > thr)[0, 0].detach().cpu().numpy()
+            car_debug['high_mask'] = high_mask_np
+            car_debug['sim_max'] = float(sim_full.amax().item())
+            car_debug['thr'] = float(thr.item())
+            car_debug['abs_floor'] = float(abs_floor)
+            n_high = int(high_mask_np.sum())
+            car_debug['n_high_pixels'] = n_high
 
-            ids_t_obj = torch.from_numpy(ids_np).to(device=device, dtype=torch.long)
-            log_parts: list[str] = []
-            for qi, layer_name in enumerate(self._object_layer_names):
-                vals_q = dilated_np[qi, v, u].astype(np.float32)                  # per-node score
-                vmax = float(vals_q.max()) if vals_q.size else 0.0
-                # Per-frame normalisation; all-zero frames stay all-zero.
-                norm_q = vals_q / vmax if vmax > 0.0 else vals_q
-                norm_t = torch.from_numpy(norm_q).to(device=device, dtype=torch.float32)
-                self.builder.ingest_layer_scores(layer_name, ids_t_obj, norm_t)
-                log_parts.append(
-                    f'{self.object_queries[qi]}[sim_max={sim_max[qi]:.3f} '
-                    f'thr={thr_np[qi]:.3f} '
-                    f'nodes_hit={int((vals_q > 0).sum())}]'
+            # Noise guardrail: a handful of stray pixels is almost certainly
+            # not a car.  Drop the detection so all node scores reset to 0.
+            detection_valid = n_high >= self._car_min_high_pixels
+            if not detection_valid:
+                # Wipe the mask so the debug overlay also reflects "no detection".
+                high_mask_np[:] = False
+                car_debug['high_mask'] = high_mask_np
+                n_high = 0
+
+            car_xyz_odom: Optional[np.ndarray] = None
+            nearest_pixel_dist = float('inf')
+            if n_high > 0:
+                ys, xs = np.where(high_mask_np)
+                cu = float(xs.mean())
+                cv_c = float(ys.mean())
+                car_debug['centroid_uv'] = (cu, cv_c)
+
+                if proj['visible_u'].size > 0:
+                    du = proj['visible_u'].astype(np.float64) - cu
+                    dv = proj['visible_v'].astype(np.float64) - cv_c
+                    d2 = du * du + dv * dv
+                    idx_near = int(np.argmin(d2))
+                    nearest_pixel_dist = float(np.sqrt(d2[idx_near]))
+                    car_debug['nearest_node_uv'] = (
+                        float(proj['visible_u'][idx_near]),
+                        float(proj['visible_v'][idx_near]),
+                    )
+
+                    # Pixel-distance guardrail: if the nearest projected node
+                    # is farther than the configured threshold from the
+                    # centroid, the anchor is untrustworthy → drop detection.
+                    if (self._car_max_centroid_node_px <= 0.0
+                            or nearest_pixel_dist <= self._car_max_centroid_node_px):
+                        car_xyz_odom = np.asarray(
+                            proj['visible_pos_odom'][idx_near], dtype=np.float64,
+                        )
+                        car_debug['car_xyz_odom'] = car_xyz_odom
+            car_debug['nearest_node_pixel_dist'] = nearest_pixel_dist
+
+            # Per-frame car scores — subset-only ingest with MAX merge.
+            # We only push scores for nodes within the distance threshold.
+            # The layer's CUSTOM merge takes the elementwise max with the
+            # previously-stored score, so:
+            #   * a node that has never been near a car stays at 0,
+            #   * a node painted once keeps its colour forever,
+            #   * a node painted twice keeps the brighter colour.
+            # No-detection frames simply skip the ingest call.
+            all_pos_t = self._last_result.node_positions                         # (N, 3) on device
+            all_ids_t = self._last_result.node_ids                               # (N,) on device
+            n_total = int(all_pos_t.shape[0]) if all_pos_t is not None else 0
+            n_near = 0
+            if n_total > 0 and car_xyz_odom is not None:
+                car_pos_t = torch.as_tensor(
+                    car_xyz_odom, dtype=all_pos_t.dtype, device=all_pos_t.device,
                 )
-            obj_hits_log = ' ' + ' '.join(log_parts)
+                dist_t = torch.linalg.norm(all_pos_t - car_pos_t, dim=1)
+                thr_m = float(self._car_distance_threshold)
+                in_range = dist_t < thr_m
+                n_near = int(in_range.sum().item())
+                if n_near > 0:
+                    score_t = (1.0 - dist_t[in_range] / thr_m).to(dtype=torch.float32)
+                    ids_long_t = all_ids_t[in_range].to(dtype=torch.long)
+                    self.builder.ingest_layer_scores(
+                        self._car_layer_name, ids_long_t, score_t,
+                    )
+
+            nn_px = car_debug['nearest_node_pixel_dist']
+            nn_px_str = f'{nn_px:.1f}' if math.isfinite(nn_px) else 'inf'
+            obj_hits_log = (
+                f' car[sim_max={car_debug["sim_max"]:.3f} '
+                f'thr={car_debug["thr"]:.3f} '
+                f'abs_floor={car_debug["abs_floor"]:.3f} '
+                f'high_px={n_high}/{self._car_min_high_pixels}min '
+                f'nn_px={nn_px_str}/{self._car_max_centroid_node_px:.0f}max '
+                f'within_{self._car_distance_threshold:.1f}m={n_near}]'
+            )
 
         self.get_logger().info(
             f'[explorfm rgb={self._rgb_count}] infer={infer_ms:.1f}ms '
@@ -1752,7 +2218,429 @@ class OdinNavGraphNode(Node):
             f'front[min={front_np.min():.2f} max={front_np.max():.2f}]'
             f'{obj_hits_log}'
         )
-        return trav_vals, front_vals_full
+        return trav_vals, front_vals_full, car_debug, frontier_debug
+
+    def _enqueue_car_debug_save(
+        self,
+        rgb: np.ndarray,
+        proj: dict,
+        car_debug: Optional[dict],
+        idx: int,
+    ) -> None:
+        """Snapshot inputs on the executor thread, queue for the worker.
+
+        Reading persistent car-layer scores happens here (synchronously, on
+        the executor thread) so the worker stays pure CPU and never touches
+        the GPU layer registry — that avoids any read/write races with the
+        next ``ingest_layer_scores`` call from a later image callback.
+        """
+        if self._car_debug_queue is None:
+            return
+
+        visible_ids_np = proj['visible_ids']
+        n_vis = int(visible_ids_np.size)
+        visible_norm = np.zeros(n_vis, dtype=np.float32)
+
+        car_layer = self.builder._layer_registry._external_layers.get(
+            self._car_layer_name,
+        )
+        if (car_layer is not None
+                and getattr(car_layer, '_scores', None) is not None
+                and self._last_result is not None
+                and self._last_result.num_nodes > 0):
+            device = car_layer._scores.device
+            all_ids_t = self._last_result.node_ids.to(device=device, dtype=torch.long)
+            all_scores = car_layer.read(all_ids_t, device).detach().cpu().numpy()
+            score_min = float(all_scores.min()) if all_scores.size else 0.0
+            score_max = float(all_scores.max()) if all_scores.size else 1.0
+            if score_max <= score_min:
+                score_max = score_min + 1e-6
+            if n_vis > 0:
+                vis_ids_t = torch.from_numpy(visible_ids_np).to(
+                    device=device, dtype=torch.long,
+                )
+                vis_scores = car_layer.read(vis_ids_t, device).detach().cpu().numpy()
+                visible_norm = np.clip(
+                    (vis_scores - score_min) / (score_max - score_min), 0.0, 1.0,
+                )
+
+        centroid_uv = None
+        if car_debug is not None and car_debug.get('centroid_uv') is not None:
+            cu, cv_c = car_debug['centroid_uv']
+            centroid_uv = (float(cu), float(cv_c))
+
+        # rgb is a fresh decode in image_cb (no other reader), so we pass
+        # the reference directly — no extra megabyte-scale copy per frame.
+        payload = {
+            'rgb':         rgb,
+            'visible_u':   np.ascontiguousarray(proj['visible_u']),
+            'visible_v':   np.ascontiguousarray(proj['visible_v']),
+            'visible_norm': visible_norm,
+            'edge_uvs': (
+                np.ascontiguousarray(proj['visible_edge_uv'])
+                if self._debug_image_draw_edges
+                else np.empty((0, 4), dtype=np.int32)
+            ),
+            'centroid_uv': centroid_uv,
+            'idx':         int(idx),
+        }
+
+        # Drop oldest if the worker is behind, then enqueue. Putters never block.
+        while True:
+            try:
+                self._car_debug_queue.put_nowait(payload)
+                return
+            except queue.Full:
+                try:
+                    self._car_debug_queue.get_nowait()
+                except queue.Empty:
+                    pass
+
+    def _car_debug_worker(self) -> None:
+        """Background thread: render queued debug snapshots to PDF.
+
+        Uses cv2 for in-memory raster drawing and PIL for the PDF wrap.
+        Both release the GIL during their main I/O, so the ROS executor
+        keeps spinning while we save.
+        """
+        # Lazy imports keep node-import cost low if the debug dir is unset.
+        try:
+            from PIL import Image  # Pillow
+        except ImportError as exc:
+            self.get_logger().error(
+                f'Pillow (PIL) not installed; car-debug PDF saving disabled: {exc}',
+            )
+            return
+        while True:
+            payload = self._car_debug_queue.get()
+            try:
+                self._render_and_save_car_debug(payload, Image)
+            except Exception as exc:  # pragma: no cover  - defensive
+                import traceback
+                self.get_logger().error(
+                    f'car-debug save failed: {exc}\n{traceback.format_exc()}',
+                    throttle_duration_sec=5.0,
+                )
+            finally:
+                self._car_debug_queue.task_done()
+
+    def _render_and_save_car_debug(self, payload: dict, pil_image_cls) -> None:
+        """CPU-only render + single-page raster-PDF save.
+
+        Inverted RViz rainbow so high score (close to the car) is blue and
+        low score (far / never seen) is red — opposite of the on-screen
+        cloud, which is what the user asked for in the saved PDFs.
+        """
+        rgb = payload['rgb']
+        visible_u = payload['visible_u']
+        visible_v = payload['visible_v']
+        visible_norm = payload['visible_norm']
+        edge_uvs = payload['edge_uvs']
+        centroid_uv = payload['centroid_uv']
+        idx = payload['idx']
+
+        img = rgb.copy()  # cv2 draws in-place; preserve original
+
+        # ── Edges first so the node dots sit on top of the lines.
+        for u0, v0, u1, v1 in edge_uvs:
+            cv2.line(img, (int(u0), int(v0)), (int(u1), int(v1)),
+                     (255, 255, 255), 2)
+
+        if visible_u.size > 0:
+            lut = _RVIZ_RAINBOW_LUT
+            # Invert: high score → low LUT index → blue; low score → red.
+            lut_idx = np.clip(
+                ((1.0 - visible_norm) * (lut.shape[0] - 1)).round().astype(int),
+                0, lut.shape[0] - 1,
+            )
+            colors_rgb = (lut[lut_idx] * 255.0).astype(np.uint8)  # (N, 3)
+            for u, v, c in zip(visible_u, visible_v, colors_rgb):
+                center = (int(u), int(v))
+                cv2.circle(img, center, 14, (int(c[0]), int(c[1]), int(c[2])), -1)
+                cv2.circle(img, center, 14, (0, 0, 0), 1)  # thin black outline
+
+        if centroid_uv is not None:
+            cv2.drawMarker(
+                img, (int(centroid_uv[0]), int(centroid_uv[1])),
+                (255, 255, 0), markerType=cv2.MARKER_CROSS,
+                markerSize=40, thickness=4,
+            )
+
+        if self._car_debug_dir is not None:
+            pdf_path = self._car_debug_dir / f'car_debug_{idx:06d}.pdf'
+            pil_image_cls.fromarray(img).save(str(pdf_path), 'PDF', resolution=100.0)
+        if self._car_debug_png_dir is not None:
+            png_path = self._car_debug_png_dir / f'car_debug_{idx:06d}.png'
+            cv2.imwrite(str(png_path), cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+
+    # ── Frontier-layer debug saver (parallel to the car saver) ──────────
+
+    def _enqueue_frontier_debug_save(
+        self,
+        rgb: np.ndarray,
+        proj: dict,
+        frontier_debug: Optional[dict],
+        idx: int,
+    ) -> None:
+        """Snapshot frontier-score state on the executor thread, enqueue.
+
+        Sends:
+          * the per-pixel heatmap (only used to find *high* pixels in the
+            renderer — everything outside the high mask stays raw RGB),
+          * non-frontier visible node pixels (drawn as solid red dots),
+          * frontier visible node pixels + normalised scores (drawn as
+            hollow circles coloured by the persistent ``frontier_score``
+            layer, matching the on-screen ``/frontier_score_cloud``),
+          * ``score_min`` / ``score_max`` — the RViz autobounds across all
+            current frontier nodes (used by both the heatmap colour-mapping
+            and the legend so the colours are unified).
+        """
+        if self._frontier_debug_queue is None:
+            return
+
+        front_map_np = None
+        if frontier_debug is not None:
+            front_map_np = frontier_debug.get('front_map_np')
+
+        visible_u_all = np.ascontiguousarray(proj['visible_u'])
+        visible_v_all = np.ascontiguousarray(proj['visible_v'])
+        visible_types_np = proj['visible_types']
+        front_mask = visible_types_np == 2
+
+        nonfront_u = visible_u_all[~front_mask]
+        nonfront_v = visible_v_all[~front_mask]
+        front_u = visible_u_all[front_mask]
+        front_v = visible_v_all[front_mask]
+        n_vis_front = int(front_mask.sum())
+
+        score_min = 0.0
+        score_max = 1.0
+        frontier_norm = np.empty(0, dtype=np.float32)
+
+        front_layer = self.builder._layer_registry._external_layers.get(
+            self._front_layer_name,
+        )
+        if (front_layer is not None
+                and getattr(front_layer, '_scores', None) is not None
+                and self._last_result is not None
+                and self._last_result.num_nodes > 0):
+            device = front_layer._scores.device
+
+            # Autocompute bounds across ALL current frontier nodes — same
+            # rule RViz applies to the /frontier_score_cloud display.
+            all_types = self._last_result.node_types
+            all_ids = self._last_result.node_ids
+            all_front_mask = all_types == 2
+            if bool(all_front_mask.any().item()):
+                front_ids_all = all_ids[all_front_mask].to(
+                    device=device, dtype=torch.long,
+                )
+                all_front_scores = (
+                    front_layer.read(front_ids_all, device).detach().cpu().numpy()
+                )
+                valid = np.isfinite(all_front_scores)
+                if valid.any():
+                    score_min = float(all_front_scores[valid].min())
+                    score_max = float(all_front_scores[valid].max())
+            if score_max <= score_min:
+                score_max = score_min + 1e-6
+
+            if n_vis_front > 0:
+                vis_ids_front = proj['visible_ids'][front_mask]
+                vis_ids_t = torch.from_numpy(vis_ids_front).to(
+                    device=device, dtype=torch.long,
+                )
+                vis_scores = front_layer.read(vis_ids_t, device).detach().cpu().numpy()
+                vis_scores = np.where(np.isfinite(vis_scores), vis_scores, score_min)
+                frontier_norm = np.clip(
+                    (vis_scores - score_min) / (score_max - score_min), 0.0, 1.0,
+                ).astype(np.float32)
+
+        payload = {
+            'rgb':            rgb,
+            'front_map_np':   front_map_np,
+            'front_u':        np.ascontiguousarray(front_u),
+            'front_v':        np.ascontiguousarray(front_v),
+            'frontier_norm':  frontier_norm,
+            'nonfront_u':     np.ascontiguousarray(nonfront_u),
+            'nonfront_v':     np.ascontiguousarray(nonfront_v),
+            'edge_uvs':       (
+                np.ascontiguousarray(proj['visible_edge_uv'])
+                if self._debug_image_draw_edges
+                else np.empty((0, 4), dtype=np.int32)
+            ),
+            'score_min':      float(score_min),
+            'score_max':      float(score_max),
+            'high_std_k':     float(self._frontier_debug_high_std_k),
+            'idx':            int(idx),
+        }
+
+        while True:
+            try:
+                self._frontier_debug_queue.put_nowait(payload)
+                return
+            except queue.Full:
+                try:
+                    self._frontier_debug_queue.get_nowait()
+                except queue.Empty:
+                    pass
+
+    def _frontier_debug_worker(self) -> None:
+        """Background thread: render queued frontier debug snapshots to PDF."""
+        try:
+            from PIL import Image  # Pillow
+        except ImportError as exc:
+            self.get_logger().error(
+                f'Pillow (PIL) not installed; frontier-debug PDF saving disabled: {exc}',
+            )
+            return
+        while True:
+            payload = self._frontier_debug_queue.get()
+            try:
+                self._render_and_save_frontier_debug(payload, Image)
+            except Exception as exc:  # pragma: no cover  - defensive
+                import traceback
+                self.get_logger().error(
+                    f'frontier-debug save failed: {exc}\n{traceback.format_exc()}',
+                    throttle_duration_sec=5.0,
+                )
+            finally:
+                self._frontier_debug_queue.task_done()
+
+    def _render_and_save_frontier_debug(self, payload: dict, pil_image_cls) -> None:
+        """CPU-only render + single-page raster-PDF save.
+
+        Layers (bottom→top):
+          * raw RGB (default — most pixels stay untouched),
+          * patch-only ExploRFM heatmap: only pixels with score above
+            mean + k·std (this frame's distribution) get the rainbow tint,
+          * non-frontier visible nodes: solid red dots (small),
+          * frontier visible nodes: HOLLOW rings, colour = persistent
+            ``frontier_score`` mapped via the same RViz rainbow +
+            autobounds the on-screen ``/frontier_score_cloud`` uses,
+          * legend in the top-right: rainbow bar with the numeric
+            ``score_min`` and ``score_max`` so the colour↔score mapping
+            is readable from the saved frame alone.
+
+        Direction matches the on-screen cloud (high score → red), unlike
+        the car saver which is inverted.
+        """
+        rgb = payload['rgb']
+        front_map_np = payload['front_map_np']
+        front_u = payload['front_u']
+        front_v = payload['front_v']
+        frontier_norm = payload['frontier_norm']
+        nonfront_u = payload['nonfront_u']
+        nonfront_v = payload['nonfront_v']
+        edge_uvs = payload['edge_uvs']
+        score_min = payload['score_min']
+        score_max = payload['score_max']
+        high_std_k = payload['high_std_k']
+        idx = payload['idx']
+
+        img = rgb.copy()
+        H, W = img.shape[:2]
+        lut = _RVIZ_RAINBOW_LUT
+        n_lut = lut.shape[0]
+        span = max(score_max - score_min, 1e-6)
+
+        # ── Heatmap: ONLY high-scoring pixels get tinted.  Threshold is
+        # the per-frame mean + k·std of the raw ExploRFM map, so the
+        # "high" set scales with image content rather than a fixed cutoff.
+        # Colour inside the patch is normalised to the PATCH's own
+        # [min, max] (the dimmest high pixel → blue, the brightest → red)
+        # so the rainbow spans the full LUT instead of clamping the whole
+        # patch to red.  The two scales (patch heatmap vs. persistent node
+        # score) get separate legend bars below.
+        patch_min: float = float('nan')
+        patch_max: float = float('nan')
+        if front_map_np is not None:
+            if front_map_np.shape != (H, W):
+                front_map_np = cv2.resize(
+                    front_map_np, (W, H), interpolation=cv2.INTER_LINEAR,
+                )
+            f_mean = float(front_map_np.mean())
+            f_std = float(front_map_np.std())
+            thr = f_mean + high_std_k * f_std
+            high_mask = front_map_np > thr
+            if high_mask.any():
+                high_vals = front_map_np[high_mask]
+                patch_min = float(high_vals.min())
+                patch_max = float(high_vals.max())
+                patch_span = max(patch_max - patch_min, 1e-6)
+                norm_map = np.clip(
+                    (front_map_np - patch_min) / patch_span, 0.0, 1.0,
+                )
+                lut_idx_map = np.clip(
+                    (norm_map * (n_lut - 1)).round().astype(np.int32),
+                    0, n_lut - 1,
+                )
+                heat_u8 = (lut[lut_idx_map] * 255.0).astype(np.uint8)
+                alpha = 0.6
+                masked = high_mask[..., None]
+                img = np.where(
+                    masked,
+                    (img.astype(np.float32) * (1.0 - alpha)
+                     + heat_u8.astype(np.float32) * alpha).astype(np.uint8),
+                    img,
+                )
+
+        # ── Edges between visible nodes — drawn above the heatmap but
+        # below the node dots so the lines don't cover the markers.
+        for u0, v0, u1, v1 in edge_uvs:
+            cv2.line(img, (int(u0), int(v0)), (int(u1), int(v1)),
+                     (255, 255, 255), 2)
+
+        # ── Non-frontier (free-space) nodes: solid red small dots.
+        for u, v in zip(nonfront_u, nonfront_v):
+            center = (int(u), int(v))
+            cv2.circle(img, center, 8, (255, 0, 0), -1)
+            cv2.circle(img, center, 8, (0, 0, 0), 1)
+
+        # ── Frontier nodes: HOLLOW rings coloured by persistent score.
+        # Thick coloured outline + thin black contrast rings so the ring
+        # reads against both bright and dark backgrounds.
+        if front_u.size > 0:
+            lut_idx = np.clip(
+                (frontier_norm * (n_lut - 1)).round().astype(int),
+                0, n_lut - 1,
+            )
+            colors_rgb = (lut[lut_idx] * 255.0).astype(np.uint8)
+            for u, v, c in zip(front_u, front_v, colors_rgb):
+                center = (int(u), int(v))
+                color_t = (int(c[0]), int(c[1]), int(c[2]))
+                cv2.circle(img, center, 14, color_t, thickness=3)
+                cv2.circle(img, center, 16, (0, 0, 0), 1)
+                cv2.circle(img, center, 11, (0, 0, 0), 1)
+
+        # ── Legend: rainbow bar with score_min / score_max labels.
+        bar_w = 240
+        bar_h = 18
+        pad = 20
+        x1 = max(0, W - pad - bar_w)
+        y1 = pad + 22  # leave room for title above
+        gradient_idx = np.linspace(0, n_lut - 1, bar_w).astype(np.int32)
+        bar_strip = (lut[gradient_idx] * 255.0).astype(np.uint8)
+        bar = np.tile(bar_strip[None, :, :], (bar_h, 1, 1))
+        img[y1:y1 + bar_h, x1:x1 + bar_w] = bar
+        cv2.rectangle(
+            img, (x1 - 1, y1 - 1), (x1 + bar_w, y1 + bar_h), (0, 0, 0), 1,
+        )
+        _put_outlined_text(img, 'frontier_score', (x1, y1 - 6), scale=0.55)
+        y2 = y1 + bar_h + 18
+        _put_outlined_text(img, f'{score_min:.2f}', (x1, y2))
+        max_str = f'{score_max:.2f}'
+        text_w = cv2.getTextSize(
+            max_str, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1,
+        )[0][0]
+        _put_outlined_text(img, max_str, (x1 + bar_w - text_w, y2))
+
+        if self._frontier_debug_dir is not None:
+            pdf_path = self._frontier_debug_dir / f'frontier_debug_{idx:06d}.pdf'
+            pil_image_cls.fromarray(img).save(str(pdf_path), 'PDF', resolution=100.0)
+        if self._frontier_debug_png_dir is not None:
+            png_path = self._frontier_debug_png_dir / f'frontier_debug_{idx:06d}.png'
+            cv2.imwrite(str(png_path), cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
 
     def _save_frame_files(
         self,
@@ -1810,14 +2698,129 @@ class OdinNavGraphNode(Node):
             f'visible={len(visible_nodes)} nodes  {len(proj["visible_edges"])} edges'
         )
 
+    # ──────────────────────────────────────────────────
+    #  Final-graph snapshot (Ctrl-C aware)
+    # ──────────────────────────────────────────────────
+
+    def save_final_graph_snapshot(self) -> None:
+        """Dump the current global graph + per-layer scores to JSON.
+
+        Schema (matched in nav_graph_node_e2e.save_final_graph_snapshot):
+          {
+            "method": "nav_graph_node",
+            "saved_at_utc": ISO8601,
+            "frame_count": int,
+            "num_nodes": int, "num_edges": int,
+            "layer_names": [str],
+            "nodes": [{id, type, position:[x,y,z], scores:{layer:value}}],
+            "edges": [{node_id_0, node_id_1, weight}],
+          }
+
+        Robust to being called when no frame has been processed (empty graph).
+        Best-effort: errors here must not block the rest of shutdown.
+        """
+        if self._graph_snapshot_path is None:
+            return
+        try:
+            gb = self.builder.global_builder
+            n_total = int(gb._global_ids.shape[0])
+            ids = gb._global_ids.detach().cpu().numpy() if n_total > 0 else np.empty((0,), dtype=np.int64)
+            pos = (gb._global_pos.detach().cpu().numpy()
+                   if n_total > 0 else np.empty((0, 3), dtype=np.float32))
+            types = (gb._global_node_types.detach().cpu().numpy()
+                     if n_total > 0 else np.empty((0,), dtype=np.int64))
+            # Edges: parallel arrays of ID pairs + weights.
+            edge_ids = (gb._global_edge_ids.detach().cpu().numpy()
+                        if gb._global_edge_ids.numel() > 0 else np.empty((0, 2), dtype=np.int64))
+            edge_w = (gb._global_edge_weights.detach().cpu().numpy()
+                      if gb._global_edge_weights.numel() > 0 else np.empty((0,), dtype=np.float32))
+
+            # Per-node layer scores.  Recompute so the snapshot reflects the
+            # very last state of every registered layer (compute_layers is
+            # called every frame anyway, but re-running is cheap and means
+            # we never miss a between-frame ingest).
+            try:
+                scores_t, layer_names = self.builder.compute_layers()
+            except Exception:
+                scores_t, layer_names = None, []
+            scores_np = (scores_t.detach().cpu().numpy()
+                         if scores_t is not None else np.empty((n_total, 0), dtype=np.float32))
+
+            nodes_out: list = []
+            for i in range(n_total):
+                row_scores = {}
+                if scores_np.shape[1] > 0:
+                    row_scores = {
+                        str(layer_names[j]): float(scores_np[i, j])
+                        for j in range(scores_np.shape[1])
+                    }
+                nodes_out.append({
+                    'id':       int(ids[i]),
+                    'type':     int(types[i]),
+                    'position': [float(pos[i, 0]), float(pos[i, 1]), float(pos[i, 2])],
+                    'scores':   row_scores,
+                })
+
+            edges_out: list = []
+            for k in range(edge_ids.shape[0]):
+                edges_out.append({
+                    'node_id_0': int(edge_ids[k, 0]),
+                    'node_id_1': int(edge_ids[k, 1]),
+                    'weight':    float(edge_w[k]) if k < edge_w.shape[0] else float('nan'),
+                })
+
+            from datetime import datetime, timezone
+            payload = {
+                'method':      'nav_graph_node',
+                'saved_at_utc': datetime.now(timezone.utc).isoformat(),
+                'frame_count': int(self.frame_count),
+                'num_nodes':   int(n_total),
+                'num_edges':   int(edge_ids.shape[0]),
+                'layer_names': [str(n) for n in layer_names],
+                'nodes':       nodes_out,
+                'edges':       edges_out,
+            }
+            with open(self._graph_snapshot_path, 'w') as f:
+                json.dump(payload, f, indent=2)
+            self.get_logger().info(
+                f'Final graph snapshot written: {self._graph_snapshot_path} '
+                f'({n_total} nodes, {edge_ids.shape[0]} edges)'
+            )
+        except Exception as exc:
+            import traceback
+            self.get_logger().error(
+                f'save_final_graph_snapshot failed: {exc}\n{traceback.format_exc()}'
+            )
+
+    def close_timing_csv(self) -> None:
+        """Flush + close the timing-CSV file if it's open.  No-op otherwise."""
+        try:
+            if self._timing_csv_file is not None and not self._timing_csv_file.closed:
+                self._timing_csv_file.flush()
+                self._timing_csv_file.close()
+        except Exception:
+            pass
+
 
 def main(args=None):
     rclpy.init(args=args)
     node = OdinNavGraphNode()
-    with suppress(KeyboardInterrupt):
-        rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        with suppress(KeyboardInterrupt):
+            rclpy.spin(node)
+    finally:
+        # Always try to persist artefacts before shutting down — even on
+        # KeyboardInterrupt or exception inside spin().
+        try:
+            node.save_final_graph_snapshot()
+        except Exception:
+            pass
+        try:
+            node.close_timing_csv()
+        except Exception:
+            pass
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':
