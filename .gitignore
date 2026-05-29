@@ -238,3 +238,6 @@ install/
 log/
 .vscode/
 e2e_debug_overlays
+*.png
+*.svg
+*.pdf

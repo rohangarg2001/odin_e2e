@@ -77,6 +77,11 @@ def stamp_to_sec(stamp) -> float:
     return stamp.sec + stamp.nanosec * 1e-9
 
 
+def _finite_or_none(v: float):
+    """Return v if finite, else None (serialises to JSON null instead of NaN)."""
+    return v if math.isfinite(v) else None
+
+
 def _pq_to_se3(translation: np.ndarray, quaternion_xyzw: np.ndarray) -> np.ndarray:
     """4x4 float64 SE3 from translation (3,) and unit quaternion (x,y,z,w)."""
     se3 = np.eye(4, dtype=np.float64)
@@ -136,7 +141,7 @@ class OdinNavGraphE2ENode(Node):
 
         # A local node within this distance (m, XYZ) of an existing global
         # node is treated as the same node and dropped.
-        self.declare_parameter('merge_node_distance', 0.5)
+        self.declare_parameter('merge_node_distance', 0.4)
 
         # Visualisation-only z offset (m) added to every published node so
         # they sit clearly above the floor in RViz.  Stored global node
@@ -148,7 +153,7 @@ class OdinNavGraphE2ENode(Node):
         # model has no depth / wall awareness and hallucinates nodes through
         # walls and beyond dead ends; this clips them before they reach the
         # graph.  0.0 disables the gate.
-        self.declare_parameter('max_node_range', 6.0)
+        self.declare_parameter('max_node_range', 30.0)
 
         # ── Edges (heatmap mode only) ────────────────────────────────
         # Edges are built per-frame from this frame's local nodes:
@@ -158,10 +163,10 @@ class OdinNavGraphE2ENode(Node):
         #   4. add (sorted) global-ID pair to a write-once global set,
         #      respecting max_edges_per_node on each endpoint.
         # DETR mode has no heatmap, so it builds no edges.
-        self.declare_parameter('max_edge_distance', 1.5)
-        self.declare_parameter('edge_traversability_threshold', 0.6)
-        self.declare_parameter('edge_line_samples', 10)
-        self.declare_parameter('max_edges_per_node', 8)
+        self.declare_parameter('max_edge_distance', 2.3)
+        self.declare_parameter('edge_traversability_threshold', 0.4)
+        self.declare_parameter('edge_line_samples', 8)
+        self.declare_parameter('max_edges_per_node', 9)
 
         # ── Graph pruning: drop nodes that ended up with zero edges ──
         # Three independent triggers, each off by default:
@@ -207,6 +212,30 @@ class OdinNavGraphE2ENode(Node):
         # Master switch — set to true to start saving overlay PNGs.
         self.declare_parameter('save_overlay', False)
 
+        # Global-graph visualisation: project ALL global nodes/edges onto the
+        # current camera image and save two PNGs per trigger frame.
+        #   save_global_viz   — master switch (off by default)
+        #   global_viz_dir    — output directory
+        #   global_viz_every_n — save every Nth processed frame
+        self.declare_parameter('save_global_viz', True)
+        self.declare_parameter(
+            'global_viz_dir',
+            '/home/rohang73/Documents/odin_e2e/e2e_debug_viz',
+        )
+        self.declare_parameter('global_viz_every_n', 1)
+        # Node visibility filter for saved images.
+        #   'none'     — draw all in-image nodes (original behaviour)
+        #   'distance' — only nodes within viz_max_distance metres of the camera
+        #   'recency'  — only nodes added in the last viz_recency_frames frames
+        self.declare_parameter('viz_filter_mode', 'distance')
+        self.declare_parameter('viz_max_distance', 35.0)
+        self.declare_parameter('viz_recency_frames', 10)
+        # Pixel-space NMS for saved images. Nodes whose projected pixel centres
+        # are closer than this many pixels are deduplicated: the node with the
+        # most conflicts is removed first (greedy), breaking ties by removing
+        # the lower-ID node. 0.0 disables.
+        self.declare_parameter('viz_min_pixel_dist', 0.0)
+
         # Static camera(optical)->base_link extrinsic (Odin Nav Stack defaults).
         self.declare_parameter('cam_base_tx', -0.0042)
         self.declare_parameter('cam_base_ty',  0.0328)
@@ -217,18 +246,19 @@ class OdinNavGraphE2ENode(Node):
         self.declare_parameter('cam_base_qw',  0.5005)
 
         # ── Graph-comparison artefacts ───────────────────────────────────
-        # Final-graph snapshot (Ctrl-C aware) + per-frame timing CSV.  Paths
-        # default to the comparison directory so the script reads them
-        # without configuration.  Empty string disables the corresponding
-        # writer.
+        # Final-graph snapshot (Ctrl-C aware) + per-frame timing CSV.
+        # ``name`` controls the file stems so multiple runs can coexist in
+        # the same inputs/ directory (e.g. name:=e2e_vitb, name:=e2e_detr).
+        # If graph_snapshot_path / timing_csv_path are set explicitly they
+        # take precedence; otherwise they are derived as
+        #   {snapshot_dir}/{name}.json  and  {snapshot_dir}/{name}_timing.csv
+        self.declare_parameter('name', 'e2e')
         self.declare_parameter(
-            'graph_snapshot_path',
-            '/home/rohang73/Documents/odin_e2e/graph_compaRISION/inputs/nav_graph_node_e2e.json',
+            'snapshot_dir',
+            '/home/rohang73/Documents/odin_e2e/graph_compaRISION/inputs',
         )
-        self.declare_parameter(
-            'timing_csv_path',
-            '/home/rohang73/Documents/odin_e2e/graph_compaRISION/inputs/nav_graph_node_e2e_timing.csv',
-        )
+        self.declare_parameter('graph_snapshot_path', '')
+        self.declare_parameter('timing_csv_path', '')
         self.declare_parameter('enable_graph_snapshot_save', True)
 
         # ── Inference-time tuning knobs ──────────────────────────────────
@@ -371,6 +401,24 @@ class OdinNavGraphE2ENode(Node):
                 'Debug overlays disabled (pass -p save_overlay:=true to enable).'
             )
 
+        self._save_global_viz_enabled = bool(gp('save_global_viz'))
+        self._global_viz_dir = Path(str(gp('global_viz_dir')))
+        self._global_viz_every_n = max(1, int(gp('global_viz_every_n')))
+        self._viz_filter_mode    = str(gp('viz_filter_mode')).strip()
+        self._viz_max_distance   = float(gp('viz_max_distance'))
+        self._viz_recency_frames = max(1, int(gp('viz_recency_frames')))
+        self._viz_min_pixel_dist = float(gp('viz_min_pixel_dist'))
+        if self._save_global_viz_enabled:
+            self._global_viz_dir.mkdir(parents=True, exist_ok=True)
+            self.get_logger().info(
+                f'Global-graph viz -> {self._global_viz_dir} '
+                f'(every {self._global_viz_every_n} processed frames)'
+            )
+        else:
+            self.get_logger().info(
+                'Global-graph viz disabled (pass -p save_global_viz:=true to enable).'
+            )
+
         # ── State ─────────────────────────────────────────────────────
         self.odom_buf: deque[Tuple[float, Odometry]] = deque()
         self.frame_count = 0
@@ -381,6 +429,7 @@ class OdinNavGraphE2ENode(Node):
         self.global_ids = torch.empty(
             (0,), dtype=torch.long, device=self._device)
         self._next_node_id = 0
+        self._node_birth_frame: dict = {}  # node_id -> frame_count when first added
         # Edge set: write-once, dedup'd by sorted global-ID pair.
         # _node_degrees enforces the max_edges_per_node cap.
         from collections import defaultdict as _defaultdict
@@ -413,10 +462,19 @@ class OdinNavGraphE2ENode(Node):
         )
 
         # ── Graph-comparison artefacts ───────────────────────────────────
+        self._run_name: str = str(gp('name')).strip() or 'e2e'
+        _snap_dir = str(gp('snapshot_dir')).strip()
+        _snap_path_str = str(gp('graph_snapshot_path')).strip()
+        _csv_path_str  = str(gp('timing_csv_path')).strip()
+        if not _snap_path_str and _snap_dir:
+            _snap_path_str = str(Path(_snap_dir) / f'{self._run_name}.json')
+        if not _csv_path_str and _snap_dir:
+            _csv_path_str  = str(Path(_snap_dir) / f'{self._run_name}_timing.csv')
+
         self._save_snapshot_enabled = bool(gp('enable_graph_snapshot_save'))
         self._graph_snapshot_path: Optional[Path] = (
-            Path(str(gp('graph_snapshot_path'))).expanduser()
-            if self._save_snapshot_enabled and str(gp('graph_snapshot_path')).strip()
+            Path(_snap_path_str).expanduser()
+            if self._save_snapshot_enabled and _snap_path_str
             else None
         )
         if self._graph_snapshot_path is not None:
@@ -435,9 +493,8 @@ class OdinNavGraphE2ENode(Node):
             't_frame_total_ms',
         ]
         if bool(gp('enable_timing_csv')):
-            csv_path_str = str(gp('timing_csv_path')).strip()
-            if csv_path_str:
-                csv_path = Path(csv_path_str).expanduser()
+            if _csv_path_str:
+                csv_path = Path(_csv_path_str).expanduser()
                 csv_path.parent.mkdir(parents=True, exist_ok=True)
                 self._timing_csv_file = open(csv_path, 'w', newline='', buffering=1)
                 self._timing_csv_writer = csv.DictWriter(
@@ -462,6 +519,14 @@ class OdinNavGraphE2ENode(Node):
         calls amortise it.
         """
         if not self._enable_torch_compile or not self._on_cuda:
+            return
+        # DETR's backbone (osp_model) is loaded via importlib and never
+        # registered in sys.modules, so TorchDynamo can't re-import it
+        # during tracing.  Skip compile for DETR to avoid the error.
+        if self._model_type == 'detr':
+            self.get_logger().info(
+                'torch.compile skipped for DETR model (osp_model not in sys.modules).'
+            )
             return
         try:
             self._model = torch.compile(self._model, mode='reduce-overhead')
@@ -908,6 +973,12 @@ class OdinNavGraphE2ENode(Node):
                 and (self.frame_count % self._debug_every_n) == 0):
             self._save_overlay(rgb, local_cam)
 
+        # 8) Global-graph viz: project all global nodes/edges onto the current
+        #    camera image and save two PNGs.  Off by default.
+        if (self._save_global_viz_enabled
+                and (self.frame_count % self._global_viz_every_n) == 0):
+            self._save_global_viz(rgb, T_odom_from_cam)
+
     def _merge_local_nodes(
         self,
         local_cam: torch.Tensor,
@@ -971,8 +1042,57 @@ class OdinNavGraphE2ENode(Node):
             self.global_nodes = torch.cat(
                 [self.global_nodes, local_odom[new_mask]], dim=0)
             self.global_ids = torch.cat([self.global_ids, new_ids], dim=0)
+            for nid in new_ids.cpu().tolist():
+                self._node_birth_frame[int(nid)] = self.frame_count
 
         return local_cam, local_ids, n_added
+
+    def _build_proximity_edges(
+        self,
+        local_cam: torch.Tensor,
+        local_ids: torch.Tensor,
+    ) -> int:
+        """DETR-mode proximity edge builder.
+
+        Connects all pairs of this frame's nodes within ``max_edge_distance``
+        (3-D camera frame), shortest first, respecting ``max_edges_per_node``.
+        No traversability check — pure proximity.
+
+        Returns the number of newly added global edges.
+        """
+        m = int(local_cam.shape[0])
+        d = torch.cdist(local_cam, local_cam)
+        iu, ju = torch.triu_indices(m, m, offset=1, device=self._device)
+        pair_d = d[iu, ju]
+        keep = pair_d <= self.max_edge_distance
+        if not keep.any():
+            return 0
+        pi = iu[keep]
+        pj = ju[keep]
+        pair_d = pair_d[keep]
+        order = torch.argsort(pair_d)
+        pi = pi[order].cpu().numpy()
+        pj = pj[order].cpu().numpy()
+        ids_np = local_ids.cpu().numpy()
+
+        cap = self.max_edges_per_node
+        n_new = 0
+        for li, lj in zip(pi.tolist(), pj.tolist()):
+            a_id = int(ids_np[li])
+            b_id = int(ids_np[lj])
+            if a_id == b_id:
+                continue
+            key = (a_id, b_id) if a_id < b_id else (b_id, a_id)
+            if key in self.global_edges:
+                continue
+            if cap > 0 and (self._node_degrees[a_id] >= cap
+                            or self._node_degrees[b_id] >= cap):
+                continue
+            self.global_edges.add(key)
+            self._node_degrees[a_id] += 1
+            self._node_degrees[b_id] += 1
+            n_new += 1
+        return n_new
 
     def _build_edges_for_frame(
         self,
@@ -980,26 +1100,27 @@ class OdinNavGraphE2ENode(Node):
         local_ids: torch.Tensor,
         img_hw: Tuple[int, int],
     ) -> int:
-        """Heatmap-line-check edge builder.  Heatmap mode only — DETR has no
-        traversability map to check against.
+        """Edge builder for both model modes.
 
-        For each pair of this frame's surviving local nodes within
-        ``max_edge_distance`` (3-D), sample N points along the line in the
-        camera frame, project them to the heatmap, and keep the pair only if
-        the minimum heatmap probability along the line clears
-        ``edge_traversability_threshold``.  Surviving pairs are added (sorted
-        by global ID) to ``self.global_edges`` write-once, respecting
-        ``max_edges_per_node`` on each endpoint, with the shortest candidates
-        added first so the local k-NN feel is preserved.
+        Heatmap mode: samples N points along each candidate line, projects to
+        the heatmap, and keeps the pair only if the fraction of in-bounds
+        samples clearing ``edge_traversability_threshold`` meets
+        ``edge_line_min_pass_fraction``.
+
+        DETR mode: no traversability map — connects pairs within
+        ``max_edge_distance`` by proximity only, shortest candidates first,
+        respecting ``max_edges_per_node``.
 
         Returns the number of *newly* added global edges.
         """
-        if (self._model_type != 'heatmap'
-                or self._last_hm_prob is None
-                or self._cam_K is None):
-            return 0
         m = int(local_cam.shape[0])
         if m < 2:
+            return 0
+
+        if self._model_type == 'detr':
+            return self._build_proximity_edges(local_cam, local_ids)
+
+        if self._last_hm_prob is None or self._cam_K is None:
             return 0
 
         # ── 1. candidate pairs within max_edge_distance, upper triangle only.
@@ -1159,10 +1280,11 @@ class OdinNavGraphE2ENode(Node):
         n_pruned = keep_py.count(False)
         if n_pruned == 0:
             return 0
-        # Drop the per-node degree entries for pruned IDs (all zero anyway).
+        # Drop the per-node degree and birth-frame entries for pruned IDs.
         for nid, k in zip(ids_list, keep_py):
             if not k:
                 self._node_degrees.pop(int(nid), None)
+                self._node_birth_frame.pop(int(nid), None)
         keep_mask = torch.tensor(
             keep_py, dtype=torch.bool, device=self._device)
         self.global_nodes = self.global_nodes[keep_mask]
@@ -1251,6 +1373,198 @@ class OdinNavGraphE2ENode(Node):
             f'[overlay] frame {self.frame_count}: local={n} '
             f'in_front={int(front.sum())} in_canvas={int(within.sum())} '
             f'in_image={n_in_image} -> {path}'
+        )
+
+    def _save_global_viz(self, rgb: np.ndarray, T_odom_from_cam: np.ndarray) -> None:
+        """Project ALL global nodes/edges into the current camera image and
+        save two PNGs to ``global_viz_dir``:
+
+            nodes_{frame:06d}.png  — RGB + every global node inside the image
+            edges_{frame:06d}.png  — same nodes + edges where at least one
+                                     endpoint is inside the image (line is
+                                     clipped at the canvas boundary)
+
+        Nodes that project outside the image boundary are not drawn.
+        Edges between two out-of-image nodes are also skipped; edges that
+        connect an in-image node to an out-of-image node are drawn and
+        clipped at the image edge by cv2.line.
+
+        ``T_odom_from_cam`` is the 4×4 SE3 from the current frame's
+        ``_process()`` call; its inverse maps global (odom) positions back
+        into the model camera frame (x_fwd, y_down, z_left).
+        """
+        if self._cam_K is None:
+            self.get_logger().warn(
+                'No camera intrinsics yet — skipping global viz.',
+                throttle_duration_sec=5.0,
+            )
+            return
+        n = int(self.global_nodes.shape[0])
+        if n == 0:
+            return
+
+        # Odom -> model camera frame.
+        T_cam_from_odom = np.linalg.inv(T_odom_from_cam)
+        R_co = T_cam_from_odom[:3, :3]
+        t_co = T_cam_from_odom[:3, 3]
+
+        pos_odom = self.global_nodes.detach().cpu().numpy().astype(np.float64)  # (N,3)
+        pos_cam = pos_odom @ R_co.T + t_co                                       # (N,3)
+
+        K = self._cam_K
+        fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+        h, w = rgb.shape[:2]
+
+        # Project (model cam: x=fwd, y=down, z=left).
+        xc = pos_cam[:, 0]
+        yc = pos_cam[:, 1]
+        zc = pos_cam[:, 2]
+        in_front = xc > 0.1
+        x_safe = np.where(in_front, xc, 1.0)
+        u_px = cx + fx * (-zc) / x_safe   # (N,)
+        v_px = cy + fy * yc  / x_safe     # (N,)
+
+        # A node is "in image" only if it's in front AND projects inside [0,w)x[0,h).
+        u_i = np.round(u_px).astype(np.int32)
+        v_i = np.round(v_px).astype(np.int32)
+        in_image = in_front & (u_i >= 0) & (u_i < w) & (v_i >= 0) & (v_i < h)
+        in_bounds = in_image.copy()  # frustum-only mask, unaffected by later filters
+
+        # ── Optional visibility filter ────────────────────────────────────────
+        if self._viz_filter_mode == 'distance':
+            # Camera position in odom frame is the translation column of T_odom_from_cam.
+            cam_pos = T_odom_from_cam[:3, 3]
+            dist = np.linalg.norm(pos_odom - cam_pos, axis=1)
+            in_image = in_image & (dist <= self._viz_max_distance)
+        elif self._viz_filter_mode == 'recency':
+            ids_np_local = self.global_ids.detach().cpu().numpy().astype(np.int64)
+            cutoff = self.frame_count - self._viz_recency_frames
+            recent = np.array(
+                [self._node_birth_frame.get(int(nid), 0) >= cutoff
+                 for nid in ids_np_local],
+                dtype=bool,
+            )
+            in_image = in_image & recent
+
+        # ── Pixel-space NMS ───────────────────────────────────────────────────
+        # Greedily remove the node with the most pixel-space conflicts until no
+        # two surviving nodes are closer than viz_min_pixel_dist pixels.
+        # Tie-break: remove the lower global-ID node (older node loses).
+        if self._viz_min_pixel_dist > 0.0:
+            cands = np.where(in_image)[0]           # indices into global arrays
+            nc = len(cands)
+            if nc > 1:
+                cu = u_i[cands].astype(np.float32)
+                cv_ = v_i[cands].astype(np.float32)
+                # Pairwise pixel distances — O(nc^2) but nc is small in practice
+                du = cu[:, None] - cu[None, :]      # (nc, nc)
+                dv = cv_[:, None] - cv_[None, :]
+                pdist = np.sqrt(du * du + dv * dv)
+                thr = self._viz_min_pixel_dist
+                # conflict[i] = set of local indices j != i with pdist[i,j] < thr
+                conflicts = [
+                    set(np.where((pdist[i] < thr) & (np.arange(nc) != i))[0])
+                    for i in range(nc)
+                ]
+                ids_np_cands = self.global_ids.detach().cpu().numpy().astype(np.int64)[cands]
+                removed = set()
+                while True:
+                    active_deg = {
+                        i: len(conflicts[i] - removed)
+                        for i in range(nc) if i not in removed
+                    }
+                    max_deg = max(active_deg.values(), default=0)
+                    if max_deg == 0:
+                        break
+                    # Among nodes with the highest conflict count, remove the
+                    # one with the smallest global ID (older node).
+                    worst = min(
+                        (i for i, d in active_deg.items() if d == max_deg),
+                        key=lambda i: int(ids_np_cands[i]),
+                    )
+                    removed.add(worst)
+                keep_local = np.array(
+                    [i for i in range(nc) if i not in removed], dtype=np.int64)
+                surviving = cands[keep_local] if len(keep_local) else np.array([], dtype=np.int64)
+                in_image = np.zeros(len(in_image), dtype=bool)
+                in_image[surviving] = True
+
+        base_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        canvas_n = base_bgr.copy()
+        canvas_e = base_bgr.copy()
+
+        ids_np = self.global_ids.detach().cpu().numpy().astype(np.int64)
+        max_id = int(ids_np.max()) + 1
+        id_to_idx = -np.ones(max_id, dtype=np.int64)
+        id_to_idx[ids_np] = np.arange(n, dtype=np.int64)
+
+        # Hide in-image nodes that have no edge connecting to another in-image node.
+        if len(self.global_edges) > 0:
+            has_visible_edge = np.zeros(n, dtype=bool)
+            for a_id, b_id in self.global_edges:
+                if a_id >= max_id or b_id >= max_id:
+                    continue
+                ia = int(id_to_idx[a_id])
+                ib = int(id_to_idx[b_id])
+                if ia < 0 or ib < 0:
+                    continue
+                if in_image[ia] and in_image[ib]:
+                    has_visible_edge[ia] = True
+                    has_visible_edge[ib] = True
+            in_image = in_image & has_visible_edge
+
+        _NODE_BGR    = (255, 170, 0)    # #00AAFF in BGR
+        _BORDER_BGR  = (0, 0, 0)
+        _NODE_RADIUS = 16
+        _BORDER      = 4
+        _EDGE_COLOR  = (255, 255, 255)  # white
+        _EDGE_ALPHA  = 0.6
+
+        # Draw edges onto a scratch layer, then blend at _EDGE_ALPHA so
+        # they appear semi-transparent.  An edge is drawn only if at least one
+        # endpoint is a visible (in_image) node.  If the other endpoint also
+        # projects into the image (in_bounds) it must also be in_image;
+        # otherwise it's simply off-screen and cv2.line clips it naturally.
+        edge_layer = canvas_e.copy()
+        for a_id, b_id in self.global_edges:
+            if a_id >= max_id or b_id >= max_id:
+                continue
+            ia = int(id_to_idx[a_id])
+            ib = int(id_to_idx[b_id])
+            if ia < 0 or ib < 0:
+                continue
+            # At least one endpoint must be a drawn node.
+            if not in_image[ia] and not in_image[ib]:
+                continue
+            # If the other endpoint projects into the image frame but its node
+            # was filtered out, skip — it would produce a dangling edge.
+            if in_image[ia] and in_bounds[ib] and not in_image[ib]:
+                continue
+            if in_image[ib] and in_bounds[ia] and not in_image[ia]:
+                continue
+            if not in_front[ia] or not in_front[ib]:
+                continue
+            cv2.line(edge_layer,
+                     (int(u_i[ia]), int(v_i[ia])),
+                     (int(u_i[ib]), int(v_i[ib])),
+                     _EDGE_COLOR, 2)
+        canvas_e = cv2.addWeighted(edge_layer, _EDGE_ALPHA, canvas_e, 1.0 - _EDGE_ALPHA, 0)
+
+        # Draw only in-image nodes on both canvases (nodes sit on top of edges).
+        for i in np.where(in_image)[0]:
+            ui, vi = int(u_i[i]), int(v_i[i])
+            for canvas in (canvas_n, canvas_e):
+                cv2.circle(canvas, (ui, vi), _NODE_RADIUS + _BORDER, _BORDER_BGR, -1)
+                cv2.circle(canvas, (ui, vi), _NODE_RADIUS, _NODE_BGR, -1)
+
+        path_n = self._global_viz_dir / f'nodes_{self.frame_count:06d}.png'
+        path_e = self._global_viz_dir / f'edges_{self.frame_count:06d}.png'
+        cv2.imwrite(str(path_n), canvas_n)
+        cv2.imwrite(str(path_e), canvas_e)
+        self.get_logger().info(
+            f'[global_viz] frame {self.frame_count}: '
+            f'{int(in_image.sum())} nodes in image / {n} total, '
+            f'{len(self.global_edges)} edges -> {self._global_viz_dir}'
         )
 
     def _publish_node_ids(self, stamp) -> None:
@@ -1366,14 +1680,14 @@ def _save_final_graph_snapshot_e2e(node: 'OdinNavGraphE2ENode') -> None:
             ia = id_to_idx.get(a, -1)
             ib = id_to_idx.get(b, -1)
             if ia < 0 or ib < 0:
-                w = float('nan')  # endpoint pruned but pair lingered
+                w = None  # endpoint pruned but pair lingered
             else:
-                w = float(np.linalg.norm(positions[ia] - positions[ib]))
+                w = _finite_or_none(float(np.linalg.norm(positions[ia] - positions[ib])))
             edges_out.append({'node_id_0': a, 'node_id_1': b, 'weight': w})
 
         from datetime import datetime, timezone
         payload = {
-            'method':       'nav_graph_node_e2e',
+            'method':       node._run_name,
             'saved_at_utc': datetime.now(timezone.utc).isoformat(),
             'frame_count':  int(node.frame_count),
             'num_nodes':    n,
@@ -1382,8 +1696,10 @@ def _save_final_graph_snapshot_e2e(node: 'OdinNavGraphE2ENode') -> None:
             'nodes':        nodes_out,
             'edges':        edges_out,
         }
-        with open(node._graph_snapshot_path, 'w') as f:
+        tmp = node._graph_snapshot_path.with_suffix('.tmp')
+        with open(tmp, 'w') as f:
             json.dump(payload, f, indent=2)
+        os.replace(tmp, node._graph_snapshot_path)
         node.get_logger().info(
             f'Final graph snapshot written: {node._graph_snapshot_path} '
             f'({n} nodes, {len(edges_out)} edges)'

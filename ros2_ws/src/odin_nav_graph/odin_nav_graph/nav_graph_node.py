@@ -41,8 +41,8 @@ from rclpy.node import Node
 
 from sensor_msgs.msg import PointCloud2, PointField, Image, CameraInfo
 from nav_msgs.msg import Odometry, OccupancyGrid, MapMetaData
-from std_msgs.msg import Header
-from visualization_msgs.msg import Marker
+from std_msgs.msg import Header, ColorRGBA
+from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point, Pose, Quaternion
 import base64
 import colorsys
@@ -53,6 +53,19 @@ import threading
 from pathlib import Path
 from scipy.spatial.transform import Rotation as _ScipyR
 from scipy.ndimage import binary_dilation
+
+# RViz rainbow LUT (uint8, 256×3): index 0 → purple, index 255 → red.
+# Matches the colourmap used in all saved debug images so Foxglove shows
+# identical colours when the pre-painted RGB cloud is published.
+def _build_rviz_rainbow_lut(n: int = 256) -> np.ndarray:
+    lut = np.empty((n, 3), dtype=np.uint8)
+    for i, t in enumerate(np.linspace(0.0, 1.0, n)):
+        h = (1.0 - float(t)) * 5.0 / 6.0
+        r, g, b = colorsys.hsv_to_rgb(h, 1.0, 1.0)
+        lut[i] = (int(r * 255), int(g * 255), int(b * 255))
+    return lut
+
+_RVIZ_RAINBOW_LUT: np.ndarray = _build_rviz_rainbow_lut()
 
 # Allow running without pip-installing nav_graph by adding the sibling
 # ``nav_graph_gpu`` checkout to sys.path.  Pip-installed nav_graph wins.
@@ -322,14 +335,15 @@ def _install_builder_patches(builder) -> None:
 
 
 def _install_builder_timing_patches(builder) -> dict:
-    """Wrap the local-graph generator + global-merge calls to record their
-    per-call durations.  Returns a dict that the caller can read after each
+    """Wrap the local-graph generator, global-merge, and builder.update calls
+    to record their per-call durations.  Returns a dict readable after each
     ``builder.update(...)``:
 
-      * ``local_ms`` — last ``local_generator.build_graph_from_grid_map`` call.
-      * ``merge_ms`` — last ``global_builder.add_local_graph_gpu`` call.
+      * ``local_ms``        — last ``local_generator.build_graph_from_grid_map`` call.
+      * ``merge_ms``        — last ``global_builder.add_local_graph_gpu`` call.
+      * ``update_total_ms`` — last ``builder.update()`` call total (including local+merge).
 
-    Both keys absent until the first wrapped call.  The patch is idempotent —
+    All keys absent until the first wrapped call.  The patch is idempotent —
     re-applying it would re-stack timings; only call once per builder.
     """
     timings: dict = {}
@@ -352,7 +366,20 @@ def _install_builder_timing_patches(builder) -> dict:
         return out
     gg.add_local_graph_gpu = _timed_merge
 
+    orig_update = builder.update
+    def _timed_update(*args, **kwargs):
+        t0 = time.perf_counter()
+        out = orig_update(*args, **kwargs)
+        timings['update_total_ms'] = (time.perf_counter() - t0) * 1000.0
+        return out
+    builder.update = _timed_update
+
     return timings
+
+
+def _finite_or_none(v: float):
+    """Return v if finite, else None (serialises to JSON null instead of NaN)."""
+    return v if math.isfinite(v) else None
 
 
 def _pq_to_se3(translation: np.ndarray, quaternion_xyzw: np.ndarray) -> np.ndarray:
@@ -419,7 +446,7 @@ def _node_circles(nodes: list) -> list:
     for node in nodes:
         u, v = node['pixel']
         color = '#ffff00' if node['type'] == 'frontier' else '#0000ff'
-        r = 7 if node['type'] == 'frontier' else 5
+        r = 14 if node['type'] == 'frontier' else 5
         parts.append(f'<circle cx="{u}" cy="{v}" r="{r}" fill="{color}" opacity="0.85"/>')
     return parts
 
@@ -453,6 +480,71 @@ def _save_svg_edges(path: Path, rgb: np.ndarray, nodes: list, edges: list) -> No
     parts += _node_circles(nodes)
     parts.append('</svg>')
     path.write_text('\n'.join(parts))
+
+
+def _frontier_scores_window_max(
+    front_np: np.ndarray,
+    front_u: np.ndarray,
+    front_v: np.ndarray,
+    window_size: int,
+    high_std_k: float = 1.0,
+) -> np.ndarray:
+    """For each high-scored heatmap window, find its nearest frontier and
+    assign that window's max value via max-merge.
+
+    Only windows above mean + high_std_k * std are considered, so low-value
+    regions never contribute scores.  Direction: region → nearest frontier
+    (NOT frontier → nearest region).
+
+    Complexity: O(H·W/ws²) pooling + O(K · N_f) distance where K = surviving
+    high-scored windows (K ≪ N_w) and N_f is small.
+    """
+    ws = window_size
+    H, W = front_np.shape
+    N_f = len(front_u)
+
+    if N_f == 0:
+        return np.empty(0, dtype=np.float32)
+
+    # ── 1. Block max pooling ──────────────────────────────────────────
+    H_w = H // ws
+    W_w = W // ws
+    if H_w == 0 or W_w == 0:
+        vc = np.clip(front_v, 0, H - 1)
+        uc = np.clip(front_u, 0, W - 1)
+        return front_np[vc, uc].astype(np.float32)
+
+    trimmed  = front_np[:H_w * ws, :W_w * ws]
+    blocks   = trimmed.reshape(H_w, ws, W_w, ws)
+    win_max  = blocks.max(axis=(1, 3)).astype(np.float32)   # (H_w, W_w)
+
+    # ── 2. Threshold: keep only high-scored windows ───────────────────
+    thr = float(front_np.mean()) + high_std_k * float(front_np.std())
+    high_mask = win_max > thr                                # (H_w, W_w) bool
+    if not high_mask.any():
+        return np.zeros(N_f, dtype=np.float32)
+
+    # ── 3. Block centre pixels (surviving windows only) ───────────────
+    row_idx = np.arange(H_w, dtype=np.float32) * ws + ws * 0.5
+    col_idx = np.arange(W_w, dtype=np.float32) * ws + ws * 0.5
+    vc_grid, uc_grid = np.meshgrid(row_idx, col_idx, indexing='ij')
+
+    vc_high   = vc_grid[high_mask]                           # (K,)
+    uc_high   = uc_grid[high_mask]                           # (K,)
+    vals_high = win_max[high_mask]                           # (K,)
+
+    # ── 4. For each high-scored window → nearest frontier ─────────────
+    fu = front_u.astype(np.float32)   # (N_f,)
+    fv = front_v.astype(np.float32)   # (N_f,)
+    du = fu[:, None] - uc_high[None, :]   # (N_f, K)
+    dv = fv[:, None] - vc_high[None, :]
+    dist2   = du * du + dv * dv            # (N_f, K)
+    nearest = dist2.argmin(axis=0)         # (K,) — index into N_f
+
+    # ── 5. Scatter-max: each frontier keeps the highest window score ──
+    scores = np.zeros(N_f, dtype=np.float32)
+    np.maximum.at(scores, nearest, vals_high)
+    return scores
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -493,10 +585,18 @@ class VisitedTimeLayer(ExternalLayer):
 class PathProximityLayer(ComputeLayer):
     """Scores every node by closeness to the robot's travelled path.
 
+    Two modes controlled by ``binary``:
+
+    * ``binary=True``  (default) — hard step: nodes within ``threshold`` m
+      score 0.0 (purple); nodes beyond score 1.0 (red).
+    * ``binary=False`` — smooth ramp: ``score = clamp(dmin / threshold, 0, 1)``,
+      so the gradient runs from 0.0 (purple, at the path) to 1.0 (red, at
+      ``threshold`` m and beyond).  Uses the same threshold as the saturation
+      distance.
+
     Each ``compute()`` appends the robot's current xy to an internal path
     buffer (gated by ``min_step`` so the buffer stays sparse, capped at
-    ``max_points``), then scores every node ``1 / (1 + falloff * d)`` where
-    ``d`` is the distance to the nearest path point.  All on the GPU.
+    ``max_points``).  All on the GPU.
     """
 
     name = 'path_proximity'
@@ -504,12 +604,14 @@ class PathProximityLayer(ComputeLayer):
     def __init__(
         self,
         layer_name: str = 'path_proximity',
-        falloff: float = 0.5,
+        threshold: float = 2.0,
+        binary: bool = False,
         min_step: float = 0.2,
         max_points: int = 8000,
     ) -> None:
         self.name = layer_name
-        self.falloff = float(falloff)
+        self.threshold = float(threshold)
+        self.binary = bool(binary)
         self._min_step_sq = float(min_step) ** 2
         self._max_points = int(max_points)
         self._path: list = []  # list of (x, y) in the odom frame
@@ -529,12 +631,193 @@ class PathProximityLayer(ComputeLayer):
 
         n = ctx.num_nodes
         if n == 0 or not self._path:
-            return torch.zeros(n, dtype=torch.float32, device=ctx.device)
+            return torch.ones(n, dtype=torch.float32, device=ctx.device)
 
         node_xy = ctx.node_positions[:, :2].contiguous()
         path_xy = torch.tensor(self._path, dtype=torch.float32, device=ctx.device)
         dmin = torch.cdist(node_xy, path_xy).amin(dim=1)
-        return 1.0 / (1.0 + self.falloff * dmin)
+        if self.binary:
+            return (dmin >= self.threshold).float()  # 0.0=close (purple), 1.0=far (red)
+        else:
+            return (dmin / self.threshold).clamp(0.0, 1.0)  # smooth purple→red ramp
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  Global occupancy map accumulator (background thread, never blocks main)
+# ─────────────────────────────────────────────────────────────────────
+
+class _GlobalOccMap:
+    """Growing world-frame occupancy map accumulated from local grid observations.
+
+    Stores each confirmed cell observation at ``resolution`` m/cell.
+    Values are uint8: 0=occupied, 128=unknown, 255=free.
+
+    Merge rule (matches GlobalGraphGenerator._update_extended_map 3-state path):
+      occupied cells are never overwritten; confirmed (free/occupied) overwrites
+      unknown; unknown new observations don't overwrite existing data.
+
+    Local grid coordinate system (same as _update_extended_map inputs):
+      col 0 = east (largest x), col W-1 = west
+      row 0 = south (smallest y), row H-1 = north
+
+    Accumulation runs in a background thread (fed via a queue) so it never
+    adds latency to the main cloud-callback path.
+    """
+
+    _UNKNOWN  = np.uint8(128)
+    _FREE     = np.uint8(255)
+    _OCCUPIED = np.uint8(0)
+    _SENTINEL = None  # queue shutdown signal
+
+    def __init__(self, resolution: float, world_extent_m: float = 200.0) -> None:
+        self._res = float(resolution)
+        n = int(math.ceil(world_extent_m / resolution))
+        if n % 2 == 0:
+            n += 1
+        self._n = n
+        self._half = n // 2
+        # grid[iy_idx, ix_idx]: row = south→north (iy), col = west→east (ix)
+        self._grid = np.full((n, n), self._UNKNOWN, dtype=np.uint8)
+        self._warned_oob = False
+
+        self._q: queue.Queue = queue.Queue(maxsize=0)
+        self._thread = threading.Thread(target=self._worker, daemon=True, name='GlobalOccMap')
+        self._thread.start()
+
+    # ── Background worker ─────────────────────────────────────────────
+
+    def _worker(self) -> None:
+        while True:
+            item = self._q.get()
+            if item is self._SENTINEL:
+                self._q.task_done()
+                break
+            center_x, center_y, resolution, H, W, new_local_grid, occ_grid_int8 = item
+            try:
+                self._accumulate(center_x, center_y, resolution, H, W,
+                                 new_local_grid, occ_grid_int8)
+            except Exception:
+                pass
+            self._q.task_done()
+
+    def _accumulate(self, center_x, center_y, resolution, H, W,
+                    new_local_grid, occ_grid_int8) -> None:
+        res = resolution
+        if occ_grid_int8 is not None:
+            local_u8 = np.full((H, W), self._UNKNOWN, dtype=np.uint8)
+            local_u8[occ_grid_int8 == 0]   = self._FREE
+            local_u8[occ_grid_int8 == 100] = self._OCCUPIED
+        else:
+            local_u8 = new_local_grid.astype(np.uint8)
+
+        if (local_u8 == self._UNKNOWN).all():
+            return
+
+        # wx(c) = cx + (W/2 - c - 0.5)*res  →  ix = floor(wx/res)
+        # wy(r) = cy + (r - H/2 + 0.5)*res  →  iy = floor(wy/res)
+        ix_base = int(np.floor(center_x / res + W / 2 - 0.5))
+        iy_base = int(np.floor(center_y / res - H / 2 + 0.5))
+
+        ix_arr = ix_base - np.arange(W, dtype=np.int32)  # (W,) east→west
+        iy_arr = iy_base + np.arange(H, dtype=np.int32)  # (H,) south→north
+
+        gc = ix_arr + self._half  # global col (west→east)
+        gr = iy_arr + self._half  # global row (south→north)
+
+        if not ((gc >= 0).all() and (gc < self._n).all()
+                and (gr >= 0).all() and (gr < self._n).all()):
+            if not self._warned_oob:
+                print('[GlobalOccMap] WARNING: cells out of bounds — '
+                      'increase world_extent_m', flush=True)
+                self._warned_oob = True
+            gc = np.clip(gc, 0, self._n - 1)
+            gr = np.clip(gr, 0, self._n - 1)
+
+        GR, GC = np.meshgrid(gr, gc, indexing='ij')  # (H, W)
+        current = self._grid[GR, GC]
+        overwrite = (local_u8 != self._UNKNOWN) & (current != self._OCCUPIED)
+        if overwrite.any():
+            self._grid[GR[overwrite], GC[overwrite]] = local_u8[overwrite]
+
+    # ── Public API ────────────────────────────────────────────────────
+
+    def enqueue(self, center_x: float, center_y: float, resolution: float,
+                H: int, W: int,
+                new_local_grid: np.ndarray,
+                occ_grid_int8: Optional[np.ndarray] = None) -> None:
+        """Non-blocking: copy arrays and push to the background worker."""
+        self._q.put_nowait((
+            center_x, center_y, resolution, H, W,
+            new_local_grid.copy(),
+            occ_grid_int8.copy() if occ_grid_int8 is not None else None,
+        ))
+
+    def shutdown(self) -> None:
+        """Flush the queue and stop the worker thread."""
+        self._q.put(self._SENTINEL)
+        self._thread.join(timeout=30.0)
+
+    def save(self, out_dir: Path, name: str = 'global_occ_map') -> Tuple[Optional[Path], Optional[Path]]:
+        """Crop to observed bounds, write ``<name>.npz`` + ``<name>.png``."""
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        known = self._grid != self._UNKNOWN
+        rows_any = np.any(known, axis=1)
+        cols_any = np.any(known, axis=0)
+        if not rows_any.any():
+            print('[GlobalOccMap] No observations — skipping save', flush=True)
+            return None, None
+
+        r_min = int(np.where(rows_any)[0][0])
+        r_max = int(np.where(rows_any)[0][-1])
+        c_min = int(np.where(cols_any)[0][0])
+        c_max = int(np.where(cols_any)[0][-1])
+        pad = 5
+        r0 = max(0, r_min - pad)
+        r1 = min(self._n, r_max + pad + 1)
+        c0 = max(0, c_min - pad)
+        c1 = min(self._n, c_max + pad + 1)
+
+        crop = self._grid[r0:r1, c0:c1]
+        origin_x = float((c0 - self._half) * self._res)
+        origin_y = float((r0 - self._half) * self._res)
+
+        # NPZ: grid + georeferencing metadata
+        npz_path = out_dir / f'{name}.npz'
+        np.savez_compressed(
+            str(npz_path),
+            grid=crop,
+            origin_x=np.float64(origin_x),
+            origin_y=np.float64(origin_y),
+            resolution=np.float64(self._res),
+        )
+
+        # PNG: white=free, black=occupied, gray=unknown; north is up
+        h, w = crop.shape
+        rgb = np.full((h, w, 3), 128, dtype=np.uint8)
+        rgb[crop == self._FREE]     = [255, 255, 255]
+        rgb[crop == self._OCCUPIED] = [0,   0,   0  ]
+        png_path = out_dir / f'{name}.png'
+        cv2.imwrite(str(png_path),
+                    cv2.cvtColor(np.flipud(rgb), cv2.COLOR_RGB2BGR))
+
+        return npz_path, png_path
+
+
+def _make_global_occ_hook(gg, original_fn, accumulator: _GlobalOccMap):
+    """Wrap ``_update_extended_map`` to enqueue data for the occ-map accumulator.
+    The enqueue is O(1) copy + put — it never blocks the main callback thread.
+    """
+    def _patched(new_local_grid, center_x, center_y, resolution, occ_grid_int8=None):
+        original_fn(new_local_grid, center_x, center_y, resolution,
+                    occ_grid_int8=occ_grid_int8)
+        try:
+            H, W = new_local_grid.shape
+            accumulator.enqueue(center_x, center_y, resolution, H, W,
+                                new_local_grid, occ_grid_int8)
+        except Exception:
+            pass  # never block the main pipeline
+    return _patched
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -545,6 +828,9 @@ class OdinNavGraphNode(Node):
     def __init__(self) -> None:
         super().__init__('odin_nav_graph_node')
 
+        #note: low elev height diff causes few nodes especially in thin areas
+        #keep the 
+
         # ── Parameters ────────────────────────────────────────────────
         self.declare_parameter('cloud_topic', '/odin1/cloud_raw')
         self.declare_parameter('odom_topic', '/odin1/odometry_highfreq')
@@ -552,10 +838,10 @@ class OdinNavGraphNode(Node):
         self.declare_parameter('robot_frame', 'odin1_base_link')
 
         # Elevation map geometry
-        self.declare_parameter('map_length_xy', 12.0)
+        self.declare_parameter('map_length_xy', 30.0)
         self.declare_parameter('map_resolution', 0.10)
-        self.declare_parameter('cloud_max_range', 7.0)
-        self.declare_parameter('sensor_noise_factor', 0.05)
+        self.declare_parameter('cloud_max_range', 17.0)
+        self.declare_parameter('sensor_noise_factor', 0.00)
         # Drop elevation cells whose absolute height differs from the robot's
         # current odom z by more than this many metres (catches roofs/ceilings
         # the lidar sweeps in).  0 disables the filter.
@@ -571,13 +857,13 @@ class OdinNavGraphNode(Node):
         self.declare_parameter('safety_distance', 0.05)
         self.declare_parameter('merge_node_distance', 0.6)
         self.declare_parameter('global_merge_distance', 0.6)
-        self.declare_parameter('global_max_candidate_edge_distance', 3.0)
+        self.declare_parameter('global_max_candidate_edge_distance', 1.8)
         self.declare_parameter('free_space_sampling_threshold', 0.50)
-        self.declare_parameter('boundary_inflation_factor', 1.2)
+        self.declare_parameter('boundary_inflation_factor', 2.7)
 
         self.declare_parameter('frontier_kernel_size', 2)
         self.declare_parameter('frontier_odom_threshold', 1.0)
-        self.declare_parameter('frontier_max_edge_connectivity', 14)
+        self.declare_parameter('frontier_max_edge_connectivity', 200)
         self.declare_parameter('minimum_distance_between_frontiers', 0.01)
         self.declare_parameter('minimum_points_in_cluster', 1)
         # Fraction of the neighbourhood window (relative to its area) that must
@@ -586,7 +872,7 @@ class OdinNavGraphNode(Node):
         self.declare_parameter('frontier_min_unknown_fraction', 0.25)
 
         # Elevation -> traversability params
-        self.declare_parameter('elev_max_height_diff', 0.7)
+        self.declare_parameter('elev_max_height_diff', 0.3)
         self.declare_parameter('elev_max_slope', 1.0)
         self.declare_parameter('elev_gaussian_sigma', 0.5)
         self.declare_parameter('elev_window_size', 5)
@@ -604,7 +890,7 @@ class OdinNavGraphNode(Node):
         # Counters narrow free strips next to obstacles / unknown space that the
         # sampler keeps picking up.  At 0.10 m/cell, iters=N ≈ N·10 cm of growth.
         # Either ≤ 0 disables that pass.
-        self.declare_parameter('trav_obstacle_dilate_iters', 1)
+        self.declare_parameter('trav_obstacle_dilate_iters', 3)
         self.declare_parameter('trav_unknown_dilate_iters', 1)
 
         # Throttling / publishing
@@ -671,6 +957,16 @@ class OdinNavGraphNode(Node):
         self.declare_parameter('explorfm_trav_layer', 'traversability')
         self.declare_parameter('explorfm_frontier_layer', 'frontier_score')
         self.declare_parameter('explorfm_car_detector_layer', 'car')
+        self.declare_parameter('explorfm_grass_layer', 'grass')
+        # Cosine-similarity threshold for the grass layer.  Pixels with
+        # grass_sim >= threshold are classified as grass and the node receives
+        # score 0.0 (low); pixels below threshold receive 1.0 (high / not grass).
+        self.declare_parameter('grass_sim_threshold', 0.1)
+        # When True, a node's grass score is written only once (the first time
+        # it is visible); subsequent observations of the same node are ignored.
+        # When False, scores are overwritten every time the node is visible
+        # (original behaviour).
+        self.declare_parameter('grass_freeze_score', True)
         # 3D-distance gating for the car layer: a node within
         # car_distance_threshold metres of the car's 3D centroid is scored
         # 1 - d/threshold; nodes outside are forced to 0.  The 3D centroid
@@ -681,7 +977,7 @@ class OdinNavGraphNode(Node):
         # callbacks with: RGB + projected graph nodes + the high-sim car
         # region tinted + the centroid pixel marked.  Independent of the
         # main RGB+graph saver (which is gated by save_frame_start/end).
-        self.declare_parameter('car_debug_save_every_n', 10000)
+        self.declare_parameter('car_debug_save_every_n', 1000000000)
         self.declare_parameter(
             'car_debug_dir',
             '/home/rohang73/Documents/odin_e2e/car_layer_degub_images',
@@ -693,12 +989,26 @@ class OdinNavGraphNode(Node):
             'car_debug_png_dir',
             '/home/rohang73/Documents/odin_e2e/car_layer_degub_images_png',
         )
+        # Debug-image saver for the grass layer.  PDF + optional PNG.
+        self.declare_parameter('grass_debug_save_every_n', 1)
+        self.declare_parameter(
+            'grass_debug_dir',
+            '/home/rohang73/Documents/odin_e2e/grass_layer_debug_images',
+        )
+        self.declare_parameter(
+            'grass_debug_png_dir',
+            '/home/rohang73/Documents/odin_e2e/grass_layer_debug_images_png',
+        )
+        self.declare_parameter(
+            'grass_heatmap_dir',
+            '/home/rohang73/Documents/odin_e2e/grass_heatmap',
+        )
         # Debug-image saver for the frontier_score layer.  Same async PDF
         # pipeline as the car saver — writes RGB + per-pixel ExploRFM
         # frontier heatmap overlay + visible frontier nodes coloured by
         # the persistent frontier_score layer (matches the on-screen
         # /frontier_score_cloud's RViz rainbow + autobounds).
-        self.declare_parameter('frontier_debug_save_every_n', 10000)
+        self.declare_parameter('frontier_debug_save_every_n', 100000000)
         self.declare_parameter(
             'frontier_debug_dir',
             '/home/rohang73/Documents/odin_e2e/frontier_layer_debug_images',
@@ -711,10 +1021,34 @@ class OdinNavGraphNode(Node):
         # pixels with front_map > mean + k·std are colored — everything
         # else stays as the raw RGB.  Higher k → smaller, brighter patches.
         self.declare_parameter('frontier_debug_high_std_k', 2.5)
+        # Frontier-score assignment mode:
+        #   'direct'     — sample heatmap at each frontier's projected pixel (original).
+        #   'window_max' — tile heatmap into non-overlapping windows, assign each
+        #                  window's max value to the nearest frontier in pixel space
+        #                  via max-merge.  More robust to projection jitter.
+        self.declare_parameter('frontier_score_mode', 'window_max')
+        # Window side length (px) for 'window_max' mode.
+        self.declare_parameter('frontier_score_window_size', 9)
+        # Whether to draw the ExploRFM heatmap overlay on the frontier debug image.
+        self.declare_parameter('frontier_debug_show_heatmap', False)
         # Whether to overlay graph edges (white lines between connected
         # visible nodes) in the car / frontier debug images.  Off by
         # default — set true to inspect graph connectivity in-frame.
         self.declare_parameter('debug_image_draw_edges', False)
+
+        # ── Pipeline graph visualisation ─────────────────────────────────
+        # Project all global nodes/edges onto the current camera image and
+        # save two PNGs per trigger frame (mirroring save_global_viz in the
+        # e2e node):
+        #   pipeline_viz_dir    — output directory
+        #   pipeline_viz_every_n — save every Nth image callback frame
+        # Off by default; enable with -p save_pipeline_viz:=true.
+        self.declare_parameter('save_pipeline_viz', False)
+        self.declare_parameter(
+            'pipeline_viz_dir',
+            '/home/rohang73/Documents/odin_e2e/pipeline_debug_overlays',
+        )
+        self.declare_parameter('pipeline_viz_every_n', 1)
 
         # ── Graph-comparison artefacts ───────────────────────────────────
         # Written into the same directory the comparison script reads.  The
@@ -773,10 +1107,14 @@ class OdinNavGraphNode(Node):
         self.declare_parameter('enable_path_proximity_layer', True)
         self.declare_parameter('path_proximity_layer', 'path_proximity')
 
-        # Per-node proximity falloff for the path layer.
-        # score = 1 / (1 + falloff * distance_to_nearest_source) → 1 on top of a
-        # source, decaying with distance.  0.5 ⇒ score ≈ 0.5 at 2 m away.
-        self.declare_parameter('layer_proximity_falloff', 0.5)
+        # Path-proximity scoring mode.
+        # True  → binary step at threshold (close=purple, far=red).
+        # False → smooth ramp: score = clamp(d/threshold, 0, 1).
+        self.declare_parameter('path_proximity_binary', True)
+
+        # Threshold / saturation distance for the path-proximity layer (metres).
+        # Binary mode: hard cutoff.  Continuous mode: distance at which score=1.0.
+        self.declare_parameter('path_proximity_threshold', 1.0)
 
         gp = lambda n: self.get_parameter(n).value  # noqa: E731
         cloud_topic = gp('cloud_topic')
@@ -802,7 +1140,7 @@ class OdinNavGraphNode(Node):
         self.max_graph_nodes_before_reset = int(gp('max_graph_nodes_before_reset'))
         self._z_lookup_min_filter_radius_cells = int(gp('z_lookup_min_filter_radius_cells'))
         self.viz_z_offset = float(gp('viz_z_offset'))
-        self._layer_falloff = float(gp('layer_proximity_falloff'))
+        self._path_proximity_threshold = float(gp('path_proximity_threshold'))
         self.max_edges_published = int(gp('max_edges_published'))
 
         # ── nav_graph config ──────────────────────────────────────────
@@ -814,7 +1152,7 @@ class OdinNavGraphNode(Node):
             global_merge_distance=float(gp('global_merge_distance')),
             global_max_candidate_edge_distance=float(gp('global_max_candidate_edge_distance')),
             global_max_candidate_edge_search_distance = 100,
-            global_max_connections = 10,
+            global_max_connections = 8,
             elevation_min_filter_radius=self._z_lookup_min_filter_radius_cells,
             frontier=FrontierConfig(
                 kernel_size=int(gp('frontier_kernel_size')),
@@ -824,7 +1162,7 @@ class OdinNavGraphNode(Node):
                 minimum_points_in_cluster=int(gp('minimum_points_in_cluster')),
                 min_free_fraction=float(gp('frontier_min_free_fraction')),
                 min_unknown_fraction=float(gp('frontier_min_unknown_fraction')),
-                angular_gap_min_gap_deg = 100.0,
+                angular_gap_min_gap_deg = 140.0,
             ),
             elevation_map=ElevationMapConfig(
                 gaussian_sigma=float(gp('elev_gaussian_sigma')),
@@ -842,6 +1180,13 @@ class OdinNavGraphNode(Node):
         # Sub-step timings (local-graph + global-merge) for the comparison
         # CSV — wraps the same builder before any other patches stack on top.
         self._builder_timings: dict = _install_builder_timing_patches(self.builder)
+
+        # Global occupancy map accumulator — background thread, no latency impact.
+        self._global_occ_map = _GlobalOccMap(resolution=res)
+        gg = self.builder.global_builder
+        gg._update_extended_map = _make_global_occ_hook(
+            gg, gg._update_extended_map, self._global_occ_map,
+        )
         self._trav_median_filter_size = int(gp('trav_median_filter_size'))
         self._trav_obstacle_dilate_iters = int(gp('trav_obstacle_dilate_iters'))
         self._trav_unknown_dilate_iters = int(gp('trav_unknown_dilate_iters'))
@@ -879,7 +1224,8 @@ class OdinNavGraphNode(Node):
         if bool(gp('enable_path_proximity_layer')):
             self.path_proximity_layer = PathProximityLayer(
                 layer_name=str(gp('path_proximity_layer')),
-                falloff=self._layer_falloff,
+                threshold=self._path_proximity_threshold,
+                binary=bool(gp('path_proximity_binary')),
             )
             self.builder.add_layer(self.path_proximity_layer, weight=0.0)
             self.get_logger().info(
@@ -926,6 +1272,8 @@ class OdinNavGraphNode(Node):
         #   ~/path_proximity_layer  — all nodes, closeness to the robot path.
         self.frontier_score_pub = self.create_publisher(PointCloud2, '~/frontier_score_cloud', 1)
         self.car_layer_pub = self.create_publisher(PointCloud2, '~/car_layer', 1)
+        self.grass_layer_pub = self.create_publisher(PointCloud2, '~/grass_layer', 1)
+        self.grass_only_pub  = self.create_publisher(PointCloud2, '~/grass_only', 1)
         self.path_prox_pub = self.create_publisher(PointCloud2, '~/path_proximity_layer', 1)
         # Extended global occupancy grid used for edge collision checking inside GlobalGraphGenerator.
         self.global_occ_pub = self.create_publisher(OccupancyGrid, '~/global_occ_grid', 1)
@@ -975,6 +1323,14 @@ class OdinNavGraphNode(Node):
         self._trav_layer_name = str(gp('explorfm_trav_layer'))
         self._front_layer_name = str(gp('explorfm_frontier_layer'))
         self._car_layer_name = str(gp('explorfm_car_detector_layer'))
+        self._grass_layer_name = str(gp('explorfm_grass_layer'))
+        self._grass_sim_threshold = float(gp('grass_sim_threshold'))
+        self._grass_freeze_score = bool(gp('grass_freeze_score'))
+        self._grass_text_emb: Optional[torch.Tensor] = None
+        self._last_grass_sim_max: float = 0.0
+        self._last_grass_sim_np: Optional[np.ndarray] = None
+        self._grass_scored_ids: set = set()  # node IDs already scored (freeze mode)
+        self._grass_node_scores: dict = {}   # node_id -> grass score (stable publish lookup)
         self._object_threshold = float(gp('explorfm_object_threshold'))
         self._object_std_k = float(gp('explorfm_object_std_k'))
         self._car_abs_sim_threshold = float(gp('car_absolute_sim_threshold'))
@@ -1030,7 +1386,24 @@ class OdinNavGraphNode(Node):
         # model considers visually important.
         self._frontier_debug_every_n = max(1, int(gp('frontier_debug_save_every_n')))
         self._frontier_debug_high_std_k = float(gp('frontier_debug_high_std_k'))
+        self._frontier_score_mode = str(gp('frontier_score_mode')).strip()
+        self._frontier_score_window_size = max(1, int(gp('frontier_score_window_size')))
+        self._frontier_debug_show_heatmap = bool(gp('frontier_debug_show_heatmap'))
         self._debug_image_draw_edges = bool(gp('debug_image_draw_edges'))
+
+        self._pipeline_viz_enabled = bool(gp('save_pipeline_viz'))
+        self._pipeline_viz_dir: Optional[Path] = (
+            Path(str(gp('pipeline_viz_dir')).strip())
+            if self._pipeline_viz_enabled else None
+        )
+        self._pipeline_viz_every_n = max(1, int(gp('pipeline_viz_every_n')))
+        if self._pipeline_viz_dir is not None:
+            self._pipeline_viz_dir.mkdir(parents=True, exist_ok=True)
+            self.get_logger().info(
+                f'Pipeline graph viz -> {self._pipeline_viz_dir} '
+                f'(every {self._pipeline_viz_every_n} image frames)'
+            )
+
         frontier_debug_dir_str = str(gp('frontier_debug_dir')).strip()
         self._frontier_debug_dir: Optional[Path] = (
             Path(frontier_debug_dir_str) if frontier_debug_dir_str else None
@@ -1062,11 +1435,53 @@ class OdinNavGraphNode(Node):
                 f'async worker, queue max=8)'
             )
 
+        # Grass-layer debug saver (PNG only).
+        self._grass_debug_every_n = max(1, int(gp('grass_debug_save_every_n')))
+        grass_debug_dir_str = str(gp('grass_debug_dir')).strip()
+        self._grass_debug_dir: Optional[Path] = (
+            Path(grass_debug_dir_str) if grass_debug_dir_str else None
+        )
+        grass_debug_png_str = str(gp('grass_debug_png_dir')).strip()
+        self._grass_debug_png_dir: Optional[Path] = (
+            Path(grass_debug_png_str) if grass_debug_png_str else None
+        )
+        grass_heatmap_str = str(gp('grass_heatmap_dir')).strip()
+        self._grass_heatmap_dir: Optional[Path] = (
+            Path(grass_heatmap_str) if grass_heatmap_str else None
+        )
+        if self._grass_debug_dir is not None:
+            self._grass_debug_dir.mkdir(parents=True, exist_ok=True)
+        if self._grass_debug_png_dir is not None:
+            self._grass_debug_png_dir.mkdir(parents=True, exist_ok=True)
+        if self._grass_heatmap_dir is not None:
+            self._grass_heatmap_dir.mkdir(parents=True, exist_ok=True)
+        self._grass_debug_queue: Optional[queue.Queue] = None
+        self._grass_debug_thread: Optional[threading.Thread] = None
+        if (self._grass_debug_dir is not None
+                or self._grass_debug_png_dir is not None
+                or self._grass_heatmap_dir is not None):
+            self._grass_debug_queue = queue.Queue(maxsize=8)
+            self._grass_debug_thread = threading.Thread(
+                target=self._grass_debug_worker,
+                name='GrassDebugSaver',
+                daemon=True,
+            )
+            self._grass_debug_thread.start()
+            self.get_logger().info(
+                f'Grass-layer debug images → '
+                f'PDF={self._grass_debug_dir or "off"}, '
+                f'PNG={self._grass_debug_png_dir or "off"} '
+                f'(every {self._grass_debug_every_n} image frames, '
+                f'async worker, queue max=8)'
+            )
+
         if bool(gp('enable_explorfm_layers')):
             self._init_explorfm(gp)
 
         # Subscribe to image+info if EITHER the saver OR the model is enabled.
-        if self._out_dir or self._explorfm is not None:
+        if (self._out_dir or self._explorfm is not None
+                or self._grass_debug_dir is not None
+                or self._grass_debug_png_dir is not None):
             img_topic = str(gp('cam_image_topic'))
             info_topic = str(gp('cam_info_topic'))
             self.create_subscription(CameraInfo, info_topic, self._camera_info_cb, 1)
@@ -1102,8 +1517,9 @@ class OdinNavGraphNode(Node):
             'num_input_points', 'num_valid_cells',
             'num_nodes', 'num_edges', 'num_frontiers',
             't_parse_ms', 't_emap_ms',
-            't_local_ms', 't_merge_ms', 't_other_ms', 't_graph_total_ms',
-            't_frame_total_ms',
+            't_elev_extract_ms', 't_local_ms', 't_merge_ms',
+            't_update_residual_ms', 't_visited_time_ms', 't_layers_ms',
+            't_graph_total_ms', 't_frame_total_ms',
         ]
         if bool(gp('enable_timing_csv')):
             csv_path_str = str(gp('timing_csv_path')).strip()
@@ -1250,7 +1666,11 @@ class OdinNavGraphNode(Node):
         # The wrapper applies the rot180 fix-up so the grid handed to
         # nav_graph already matches its expected (NE-at-[0,0]) convention.
         t0 = time.perf_counter()
+
+        _t = time.perf_counter()
         elev_grid = self.emap.get_elevation_for_navgraph()
+        t_elev_extract_ms = (time.perf_counter() - _t) * 1000.0
+
         cx, cy = self.emap.center_xy()
         result = self.builder.update(
             elev_grid,
@@ -1267,6 +1687,7 @@ class OdinNavGraphNode(Node):
         # Visited-time: tick the frame counter, then add +1 to the node closest
         # to the robot's current xy.  Done after update() so the closest-node
         # query sees the freshly-merged graph from this frame.
+        _t = time.perf_counter()
         if self.visited_time_layer is not None:
             self.visited_time_layer.tick()
             if result.num_nodes > 0:
@@ -1282,9 +1703,13 @@ class OdinNavGraphNode(Node):
                         node_ids=valid,
                         values=torch.ones_like(valid, dtype=torch.float32),
                     )
+        t_visited_time_ms = (time.perf_counter() - _t) * 1000.0
 
         # Compute layer scores after ingest so visited_time reflects this frame.
+        _t = time.perf_counter()
         node_scores, score_layer_names = self.builder.compute_layers()
+        t_layers_ms = (time.perf_counter() - _t) * 1000.0
+
         result.node_scores = node_scores
         result.score_layer_names = score_layer_names
 
@@ -1303,31 +1728,38 @@ class OdinNavGraphNode(Node):
         )
 
         # ── Per-frame timing CSV row.  Sub-step timings come from the
-        # builder-internal patches installed in __init__.  ``t_other_ms`` is
-        # whatever's left of t_graph after the two main steps — frontier
-        # detection, clustering, marking, layer compute, result extract.
+        # builder-internal patches installed in __init__ and from explicit
+        # timers around each sub-operation above.
+        # t_update_residual_ms is whatever remains of builder.update() after
+        # the two instrumented steps: frontier detection, clustering, etc.
         if self._timing_csv_writer is not None:
             t_local_ms = float(self._builder_timings.get('local_ms', float('nan')))
             t_merge_ms = float(self._builder_timings.get('merge_ms', float('nan')))
-            t_other_ms = float('nan')
-            if math.isfinite(t_local_ms) and math.isfinite(t_merge_ms):
-                t_other_ms = max(0.0, t_graph - t_local_ms - t_merge_ms)
+            update_total_ms = float(self._builder_timings.get('update_total_ms', float('nan')))
+            t_update_residual_ms = float('nan')
+            if (math.isfinite(update_total_ms)
+                    and math.isfinite(t_local_ms)
+                    and math.isfinite(t_merge_ms)):
+                t_update_residual_ms = max(0.0, update_total_ms - t_local_ms - t_merge_ms)
             t_frame_total_ms = (time.perf_counter() - t_frame_start) * 1000.0
             row = {
-                'frame_index':         int(self.frame_count),
-                'frame_timestamp_sec': stamp_to_sec(msg.header.stamp),
-                'num_input_points':    int(xyz_base.shape[0]),
-                'num_valid_cells':     n_valid_cells,
-                'num_nodes':           int(result.num_nodes),
-                'num_edges':           int(result.num_edges),
-                'num_frontiers':       n_frontiers,
-                't_parse_ms':          float(t_parse),
-                't_emap_ms':           float(t_emap),
-                't_local_ms':          t_local_ms,
-                't_merge_ms':          t_merge_ms,
-                't_other_ms':          t_other_ms,
-                't_graph_total_ms':    float(t_graph),
-                't_frame_total_ms':    float(t_frame_total_ms),
+                'frame_index':           int(self.frame_count),
+                'frame_timestamp_sec':   stamp_to_sec(msg.header.stamp),
+                'num_input_points':      int(xyz_base.shape[0]),
+                'num_valid_cells':       n_valid_cells,
+                'num_nodes':             int(result.num_nodes),
+                'num_edges':             int(result.num_edges),
+                'num_frontiers':         n_frontiers,
+                't_parse_ms':            float(t_parse),
+                't_emap_ms':             float(t_emap),
+                't_elev_extract_ms':     t_elev_extract_ms,
+                't_local_ms':            t_local_ms,
+                't_merge_ms':            t_merge_ms,
+                't_update_residual_ms':  t_update_residual_ms,
+                't_visited_time_ms':     t_visited_time_ms,
+                't_layers_ms':           t_layers_ms,
+                't_graph_total_ms':      float(t_graph),
+                't_frame_total_ms':      float(t_frame_total_ms),
             }
             try:
                 self._timing_csv_writer.writerow(row)
@@ -1354,6 +1786,10 @@ class OdinNavGraphNode(Node):
                 self.builder,
                 self._trav_obstacle_dilate_iters,
                 self._trav_unknown_dilate_iters,
+            )
+            gg = self.builder.global_builder
+            gg._update_extended_map = _make_global_occ_hook(
+                gg, gg._update_extended_map, self._global_occ_map,
             )
             return
 
@@ -1393,6 +1829,90 @@ class OdinNavGraphNode(Node):
             PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
             PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
             PointField(name='intensity', offset=12, datatype=PointField.FLOAT32, count=1),
+        ]
+        cloud.is_bigendian = False
+        cloud.point_step = 16
+        cloud.row_step = 16 * n
+        cloud.data = packed.tobytes()
+        cloud.is_dense = True
+        return cloud
+
+    def _make_xyz_rgb_cloud(
+        self,
+        points: np.ndarray,
+        scores: np.ndarray,
+        stamp,
+    ) -> PointCloud2:
+        """PointCloud2 with x,y,z and pre-painted RGB using the RViz rainbow LUT.
+
+        Only includes points whose score is finite — unscored (NaN) nodes are
+        excluded so Foxglove never shows false colours for nodes that haven't
+        been observed yet.  Scores are clamped to [0, 1] before LUT lookup.
+        """
+        valid = np.isfinite(scores)
+        pts = points[valid].astype(np.float32)
+        sc = np.clip(scores[valid].astype(np.float32), 0.0, 1.0)
+        n = pts.shape[0]
+
+        idx = (sc * 255.0).astype(np.int32).clip(0, 255)
+        rgb = _RVIZ_RAINBOW_LUT[idx]  # (n, 3) uint8
+
+        # Pack R, G, B into a float32 using the ROS/Foxglove convention:
+        # 0x00RRGGBB stored as a uint32, then viewed as float32.
+        rgb_u32 = (rgb[:, 0].astype(np.uint32) << 16
+                   | rgb[:, 1].astype(np.uint32) << 8
+                   | rgb[:, 2].astype(np.uint32))
+        rgb_f32 = rgb_u32.view(np.float32)
+
+        packed = np.empty((n, 4), dtype=np.float32)
+        packed[:, :3] = pts
+        packed[:, 3] = rgb_f32
+
+        cloud = PointCloud2()
+        cloud.header = Header(stamp=stamp, frame_id=self.frame_id)
+        cloud.height = 1
+        cloud.width = n
+        cloud.fields = [
+            PointField(name='x',   offset=0,  datatype=PointField.FLOAT32, count=1),
+            PointField(name='y',   offset=4,  datatype=PointField.FLOAT32, count=1),
+            PointField(name='z',   offset=8,  datatype=PointField.FLOAT32, count=1),
+            PointField(name='rgb', offset=12, datatype=PointField.FLOAT32, count=1),
+        ]
+        cloud.is_bigendian = False
+        cloud.point_step = 16
+        cloud.row_step = 16 * n
+        cloud.data = packed.tobytes()
+        cloud.is_dense = True
+        return cloud
+
+    def _make_xyz_precolored_cloud(
+        self,
+        points: np.ndarray,
+        colors_rgb: np.ndarray,
+        stamp,
+    ) -> PointCloud2:
+        """PointCloud2 with x,y,z and pre-painted RGB.
+
+        colors_rgb: (n, 3) uint8 array in RGB order.
+        Packs as 0x00RRGGBB viewed as float32 (ROS/Foxglove convention).
+        """
+        n = points.shape[0]
+        rgb_u32 = (colors_rgb[:, 0].astype(np.uint32) << 16
+                   | colors_rgb[:, 1].astype(np.uint32) << 8
+                   | colors_rgb[:, 2].astype(np.uint32))
+        rgb_f32 = rgb_u32.view(np.float32)
+        packed = np.empty((n, 4), dtype=np.float32)
+        packed[:, :3] = points.astype(np.float32)
+        packed[:, 3] = rgb_f32
+        cloud = PointCloud2()
+        cloud.header = Header(stamp=stamp, frame_id=self.frame_id)
+        cloud.height = 1
+        cloud.width = n
+        cloud.fields = [
+            PointField(name='x',   offset=0,  datatype=PointField.FLOAT32, count=1),
+            PointField(name='y',   offset=4,  datatype=PointField.FLOAT32, count=1),
+            PointField(name='z',   offset=8,  datatype=PointField.FLOAT32, count=1),
+            PointField(name='rgb', offset=12, datatype=PointField.FLOAT32, count=1),
         ]
         cloud.is_bigendian = False
         cloud.point_step = 16
@@ -1599,6 +2119,29 @@ class OdinNavGraphNode(Node):
                 self._make_xyz_intensity_cloud(pos_np, vals, stamp),
             )
 
+        # ── grass layer — keyed by node ID to avoid result.node_scores alignment bug ──
+        if self._grass_node_scores and self._grass_layer_name in names:
+            node_ids_np = result.node_ids.cpu().numpy()
+            grass_scores = np.array(
+                [self._grass_node_scores.get(int(nid), 0.0) for nid in node_ids_np],
+                dtype=np.float32,
+            )
+            # grass=1.0 → dark green, not-grass/unscored=0.0 → red.
+            _DARK_GREEN = np.array([0, 128, 0], dtype=np.uint8)
+            _RED        = np.array([210, 30, 30], dtype=np.uint8)
+            is_grass    = (grass_scores >= 0.5)[:, None]
+            colors      = np.where(is_grass, _DARK_GREEN, _RED).astype(np.uint8)
+            self.grass_layer_pub.publish(
+                self._make_xyz_precolored_cloud(pos_np, colors, stamp),
+            )
+            grass_mask = (grass_scores >= 0.5)
+            if grass_mask.any():
+                grass_pos    = pos_np[grass_mask]
+                grass_colors = np.broadcast_to(_DARK_GREEN, (grass_mask.sum(), 3)).copy()
+                self.grass_only_pub.publish(
+                    self._make_xyz_precolored_cloud(grass_pos, grass_colors, stamp),
+                )
+
         # ── path-proximity layer — read straight from the registered layer ──
         if (self.path_proximity_layer is not None and scores is not None
                 and self.path_proximity_layer.name in names):
@@ -1742,9 +2285,17 @@ class OdinNavGraphNode(Node):
             ),
             weight=0.0,
         )
+        # Grass layer: REPLACE every frame so the score reflects the most
+        # recent observation.  Score 1.0 = not grass (high traversability),
+        # 0.0 = grass (low traversability).
+        self.builder.add_layer(
+            ExternalLayer(self._grass_layer_name, ingest_policy=MergePolicy.REPLACE),
+            weight=0.0,
+        )
         self.get_logger().info(
             f'ExploRFM ready. Layers registered: '
-            f'{self._trav_layer_name!r}, {self._front_layer_name!r}, {self._car_layer_name} '
+            f'{self._trav_layer_name!r}, {self._front_layer_name!r}, '
+            f'{self._car_layer_name!r}, {self._grass_layer_name!r} '
             f'(weight=0.0 — ingest-only; raise via set_layer_weight to feed combined score).'
         )
 
@@ -1763,6 +2314,20 @@ class OdinNavGraphNode(Node):
             self.get_logger().error(
                 f'Failed to encode object queries {self.object_queries}: {exc}; '
                 'car layer will stay empty.'
+            )
+
+        try:
+            with torch.inference_mode():
+                grass_emb = self._explorfm.forward_on_text(['grass or bush'])
+            self._grass_text_emb = F.normalize(grass_emb.float(), dim=-1).contiguous()
+            self.get_logger().info(
+                f'Grass text embedding cached '
+                f'(shape={tuple(self._grass_text_emb.shape)}, '
+                f'threshold={self._grass_sim_threshold:.3f}).'
+            )
+        except Exception as exc:
+            self.get_logger().error(
+                f'Failed to encode grass query: {exc}; grass layer will stay empty.'
             )
             self._object_text_emb = None
 
@@ -1803,7 +2368,17 @@ class OdinNavGraphNode(Node):
             and self._explorfm is not None
             and (self._rgb_count % self._frontier_debug_every_n == 0)
         )
-        if not (do_infer or in_save_window or do_car_debug or do_frontier_debug):
+        do_pipeline_viz = (
+            self._pipeline_viz_dir is not None
+            and (self._rgb_count % self._pipeline_viz_every_n == 0)
+        )
+        do_grass_debug = (
+            self._grass_debug_queue is not None
+            and self._grass_text_emb is not None
+            and (self._rgb_count % self._grass_debug_every_n == 0)
+        )
+        if not (do_infer or in_save_window or do_car_debug or do_frontier_debug
+                or do_pipeline_viz or do_grass_debug):
             return
 
         if not self._cam_frame:
@@ -1876,6 +2451,115 @@ class OdinNavGraphNode(Node):
                 self.get_logger().error(
                     f'enqueue frontier-debug save failed: {exc}\n{traceback.format_exc()}'
                 )
+
+        if do_pipeline_viz:
+            try:
+                self._save_pipeline_viz(rgb, proj)
+            except Exception as exc:
+                import traceback
+                self.get_logger().error(
+                    f'_save_pipeline_viz failed: {exc}\n{traceback.format_exc()}',
+                    throttle_duration_sec=5.0,
+                )
+
+        if do_grass_debug:
+            try:
+                self._enqueue_grass_debug_save(rgb, proj, self._rgb_count)
+            except Exception as exc:
+                import traceback
+                self.get_logger().error(
+                    f'enqueue grass-debug save failed: {exc}\n{traceback.format_exc()}',
+                    throttle_duration_sec=5.0,
+                )
+
+    def _save_pipeline_viz(self, rgb: np.ndarray, proj: dict) -> None:
+        """Project ALL global nodes/edges onto the current camera image and
+        save two PNGs to ``pipeline_viz_dir``:
+
+            nodes_{rgb_count:06d}.png  — RGB + every in-image global node
+            edges_{rgb_count:06d}.png  — same nodes + edges where at least
+                                          one endpoint is inside the image
+
+        Uses the already-computed ``proj['T_opt_from_odom']`` transform so no
+        additional odom lookup is needed.  The optical frame (x-right, y-down,
+        z-fwd) projection is used — consistent with the rest of this node.
+        """
+        result = self._last_result
+        if result is None or result.num_nodes == 0:
+            return
+
+        n = int(result.num_nodes)
+        pos_odom = result.node_positions.cpu().numpy().astype(np.float64)  # (N, 3)
+        node_ids = result.node_ids.cpu().numpy()
+
+        T_opt_from_odom = proj['T_opt_from_odom']
+        R_opt = T_opt_from_odom[:3, :3]
+        t_opt = T_opt_from_odom[:3, 3]
+        pos_opt = pos_odom @ R_opt.T + t_opt   # (N, 3) optical frame
+
+        K = self._cam_K
+        h, w = rgb.shape[:2]
+
+        z = pos_opt[:, 2]
+        in_front = z > 0.1
+        z_safe = np.where(in_front, z, 1.0)
+        u_px = K[0, 0] * pos_opt[:, 0] / z_safe + K[0, 2]
+        v_px = K[1, 1] * pos_opt[:, 1] / z_safe + K[1, 2]
+
+        u_i = np.round(u_px).astype(np.int32)
+        v_i = np.round(v_px).astype(np.int32)
+        in_image = in_front & (u_i >= 0) & (u_i < w) & (v_i >= 0) & (v_i < h)
+
+        max_id = int(node_ids.max()) + 1 if n > 0 else 0
+        id_to_idx = -np.ones(max_id, dtype=np.int64)
+        id_to_idx[node_ids] = np.arange(n, dtype=np.int64)
+
+        _NODE_BGR    = (0, 0, 255)      # red in BGR
+        _BORDER_BGR  = (0, 0, 0)
+        _NODE_RADIUS = 16
+        _BORDER      = 4
+        _EDGE_COLOR  = (255, 255, 255)  # white
+        _EDGE_ALPHA  = 0.6
+
+        base_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        canvas_n = base_bgr.copy()
+        canvas_e = base_bgr.copy()
+
+        if result.num_edges > 0:
+            edge_layer = canvas_e.copy()
+            edge_arr = result.edge_index.cpu().numpy()  # (E, 2) of node IDs
+            for e in edge_arr:
+                id0, id1 = int(e[0]), int(e[1])
+                ia = int(id_to_idx[id0]) if id0 < max_id else -1
+                ib = int(id_to_idx[id1]) if id1 < max_id else -1
+                if ia < 0 or ib < 0:
+                    continue
+                if not in_image[ia] and not in_image[ib]:
+                    continue
+                if not in_front[ia] or not in_front[ib]:
+                    continue
+                cv2.line(edge_layer,
+                         (int(u_i[ia]), int(v_i[ia])),
+                         (int(u_i[ib]), int(v_i[ib])),
+                         _EDGE_COLOR, 2)
+            canvas_e = cv2.addWeighted(edge_layer, _EDGE_ALPHA, canvas_e,
+                                       1.0 - _EDGE_ALPHA, 0)
+
+        for i in np.where(in_image)[0]:
+            ui, vi = int(u_i[i]), int(v_i[i])
+            for canvas in (canvas_n, canvas_e):
+                cv2.circle(canvas, (ui, vi), _NODE_RADIUS + _BORDER, _BORDER_BGR, -1)
+                cv2.circle(canvas, (ui, vi), _NODE_RADIUS, _NODE_BGR, -1)
+
+        path_n = self._pipeline_viz_dir / f'nodes_{self._rgb_count:06d}.png'
+        path_e = self._pipeline_viz_dir / f'edges_{self._rgb_count:06d}.png'
+        cv2.imwrite(str(path_n), canvas_n)
+        cv2.imwrite(str(path_e), canvas_e)
+        self.get_logger().info(
+            f'[pipeline_viz] rgb={self._rgb_count}: '
+            f'{int(in_image.sum())} nodes in image / {n} total, '
+            f'{result.num_edges} edges -> {self._pipeline_viz_dir}'
+        )
 
     def _decode_image(self, msg: Image) -> Optional[np.ndarray]:
         """ROS Image → HxWx3 uint8 RGB. Returns None on decode failure."""
@@ -2063,12 +2747,20 @@ class OdinNavGraphNode(Node):
             types_np = proj['visible_types']
             front_mask = types_np == 2
             front_vals_full = np.full(ids_np.shape, np.nan, dtype=np.float32)
-            if front_mask.any():
-                front_vals_full[front_mask] = front_np[
-                    v[front_mask], u[front_mask],
-                ].astype(np.float32)
-
             n_front = int(front_mask.sum())
+
+            if front_mask.any():
+                if self._frontier_score_mode == 'window_max':
+                    front_vals_full[front_mask] = _frontier_scores_window_max(
+                        front_np, u[front_mask], v[front_mask],
+                        self._frontier_score_window_size,
+                        self._frontier_debug_high_std_k,
+                    )
+                else:
+                    front_vals_full[front_mask] = front_np[
+                        v[front_mask], u[front_mask],
+                    ].astype(np.float32)
+
             if n_front > 0:
                 front_ids_t = torch.from_numpy(ids_np[front_mask]).to(
                     device=device, dtype=torch.long,
@@ -2211,12 +2903,75 @@ class OdinNavGraphNode(Node):
                 f'within_{self._car_distance_threshold:.1f}m={n_near}]'
             )
 
+        # ── Grass layer: per-node sim threshold, REPLACE each frame ────────
+        grass_log = ''
+        if self._grass_text_emb is not None and ids_np.size > 0:
+            g_patch = F.normalize(ad_feats_t.float(), dim=1)          # (1, D, hp, wp)
+            g_sim = torch.einsum(
+                'nd,bdhw->bnhw', self._grass_text_emb, g_patch,
+            )                                                          # (1, 1, hp, wp)
+            g_sim_full = F.interpolate(
+                g_sim, size=rgb.shape[:2], mode='bilinear', align_corners=False,
+            )                                                          # (1, 1, H, W)
+            g_sim_np = g_sim_full[0, 0].detach().cpu().numpy()        # (H, W)
+            self._last_grass_sim_np = g_sim_np
+
+            # Sample at each visible node's projected pixel.
+            vs = np.clip(proj['visible_v'].astype(np.int32), 0, rgb.shape[0] - 1)
+            us = np.clip(proj['visible_u'].astype(np.int32), 0, rgb.shape[1] - 1)
+            sim_at_nodes = g_sim_np[vs, us]                           # (V,)
+
+            # In freeze mode, skip nodes whose score has already been committed.
+            if self._grass_freeze_score and self._grass_scored_ids:
+                new_mask = np.array(
+                    [int(nid) not in self._grass_scored_ids for nid in ids_np],
+                    dtype=bool,
+                )
+                ingest_ids  = ids_np[new_mask]
+                ingest_sims = sim_at_nodes[new_mask]
+                ingest_vs   = vs[new_mask]
+                ingest_us   = us[new_mask]
+            else:
+                ingest_ids  = ids_np
+                ingest_sims = sim_at_nodes
+                ingest_vs   = vs
+                ingest_us   = us
+
+            if ingest_ids.size > 0:
+                # Below threshold → high score (not grass); at/above → low (grass).
+                grass_scores = np.where(
+                    ingest_sims < self._grass_sim_threshold, 0.0, 1.0,
+                ).astype(np.float32)
+
+                device = self.builder.global_builder._global_pos.device
+                ids_long_t = torch.as_tensor(
+                    ingest_ids.astype(np.int64), dtype=torch.long, device=device,
+                )
+                score_t = torch.as_tensor(grass_scores, dtype=torch.float32, device=device)
+                self.builder.ingest_layer_scores(self._grass_layer_name, ids_long_t, score_t)
+
+                if self._grass_freeze_score:
+                    self._grass_scored_ids.update(int(nid) for nid in ingest_ids)
+
+                for nid, sc in zip(ingest_ids, grass_scores):
+                    self._grass_node_scores[int(nid)] = float(sc)
+
+            n_grass = int((sim_at_nodes >= self._grass_sim_threshold).sum())
+            self._last_grass_sim_max = float(g_sim_np.max())
+            grass_log = (
+                f' grass[sim_max={self._last_grass_sim_max:.3f} '
+                f'thr={self._grass_sim_threshold:.3f} '
+                f'grass_nodes={n_grass}/{ids_np.size}'
+                + (f' new={ingest_ids.size}' if self._grass_freeze_score else '')
+                + ']'
+            )
+
         self.get_logger().info(
             f'[explorfm rgb={self._rgb_count}] infer={infer_ms:.1f}ms '
             f'visible={ids_np.size} frontiers={n_front} '
             f'trav[min={trav_np.min():.2f} max={trav_np.max():.2f}] '
             f'front[min={front_np.min():.2f} max={front_np.max():.2f}]'
-            f'{obj_hits_log}'
+            f'{obj_hits_log}{grass_log}'
         )
         return trav_vals, front_vals_full, car_debug, frontier_debug
 
@@ -2373,6 +3128,160 @@ class OdinNavGraphNode(Node):
             png_path = self._car_debug_png_dir / f'car_debug_{idx:06d}.png'
             cv2.imwrite(str(png_path), cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
 
+    # ── Grass-layer debug saver ──────────────────────────────────────────
+
+    def _enqueue_grass_debug_save(
+        self,
+        rgb: np.ndarray,
+        proj: dict,
+        idx: int,
+    ) -> None:
+        """Read the current grass-layer scores, snapshot, and enqueue."""
+        if self._grass_debug_queue is None:
+            return
+
+        visible_ids_np = proj['visible_ids']
+        n_vis = int(visible_ids_np.size)
+        visible_norm = np.zeros(n_vis, dtype=np.float32)
+
+        grass_layer = self.builder._layer_registry._external_layers.get(
+            self._grass_layer_name,
+        )
+        if (grass_layer is not None
+                and getattr(grass_layer, '_scores', None) is not None
+                and self._last_result is not None
+                and self._last_result.num_nodes > 0):
+            device = grass_layer._scores.device
+            all_ids_t = self._last_result.node_ids.to(device=device, dtype=torch.long)
+            all_scores = grass_layer.read(all_ids_t, device).detach().cpu().numpy()
+            score_min = float(all_scores.min()) if all_scores.size else 0.0
+            score_max = float(all_scores.max()) if all_scores.size else 1.0
+            if score_max <= score_min:
+                score_max = score_min + 1e-6
+            if n_vis > 0:
+                vis_ids_t = torch.from_numpy(visible_ids_np).to(
+                    device=device, dtype=torch.long,
+                )
+                vis_scores = grass_layer.read(vis_ids_t, device).detach().cpu().numpy()
+                visible_norm = np.clip(
+                    (vis_scores - score_min) / (score_max - score_min), 0.0, 1.0,
+                )
+
+        payload = {
+            'rgb':              rgb,
+            'visible_u':        np.ascontiguousarray(proj['visible_u']),
+            'visible_v':        np.ascontiguousarray(proj['visible_v']),
+            'visible_norm':     visible_norm,
+            'grass_sim_max':    self._last_grass_sim_max,
+            'grass_sim_np':     self._last_grass_sim_np.copy() if self._last_grass_sim_np is not None else None,
+            'idx':              int(idx),
+        }
+        while True:
+            try:
+                self._grass_debug_queue.put_nowait(payload)
+                return
+            except queue.Full:
+                try:
+                    self._grass_debug_queue.get_nowait()
+                except queue.Empty:
+                    pass
+
+    def _grass_debug_worker(self) -> None:
+        try:
+            from PIL import Image
+        except ImportError as exc:
+            self.get_logger().error(
+                f'Pillow (PIL) not installed; grass-debug PDF saving disabled: {exc}',
+            )
+            return
+        while True:
+            payload = self._grass_debug_queue.get()
+            try:
+                self._render_and_save_grass_debug(payload, Image)
+            except Exception as exc:
+                import traceback
+                self.get_logger().error(
+                    f'grass-debug save failed: {exc}\n{traceback.format_exc()}',
+                    throttle_duration_sec=5.0,
+                )
+            finally:
+                self._grass_debug_queue.task_done()
+
+    def _render_and_save_grass_debug(self, payload: dict, pil_image_cls) -> None:
+        """Render RGB + grass-layer nodes and save as PDF and/or PNG.
+
+        Nodes are coloured by the inverted RViz rainbow (high score = purple/
+        not grass, low score = red/grass).
+        """
+        rgb           = payload['rgb']
+        visible_u     = payload['visible_u']
+        visible_v     = payload['visible_v']
+        visible_norm  = payload['visible_norm']
+        grass_sim_max = payload['grass_sim_max']
+        idx           = payload['idx']
+
+        img = rgb.copy()
+
+        label = f'grass sim max: {grass_sim_max:.3f}  thr: {self._grass_sim_threshold:.3f}'
+        org = (12, 36)
+        cv2.putText(img, label, org, cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+                    (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.putText(img, label, org, cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+                    (255, 255, 255), 2, cv2.LINE_AA)
+
+        if visible_u.size > 0:
+            lut = _RVIZ_RAINBOW_LUT
+            # Inverted: grass score 1.0 → lut index 0 → purple;
+            # not-grass score 0.0 → lut index 255 → red.
+            lut_idx = np.clip(
+                ((1.0 - visible_norm) * (lut.shape[0] - 1)).round().astype(int),
+                0, lut.shape[0] - 1,
+            )
+            colors_rgb = (lut[lut_idx] * 255.0).astype(np.uint8)
+            for u, v, c in zip(visible_u, visible_v, colors_rgb):
+                center = (int(u), int(v))
+                cv2.circle(img, center, 14, (int(c[0]), int(c[1]), int(c[2])), -1)
+                cv2.circle(img, center, 14, (0, 0, 0), 1)
+
+        if self._grass_debug_dir is not None:
+            pdf_path = self._grass_debug_dir / f'grass_debug_{idx:06d}.pdf'
+            pil_image_cls.fromarray(img).save(str(pdf_path), 'PDF', resolution=100.0)
+        if self._grass_debug_png_dir is not None:
+            png_path = self._grass_debug_png_dir / f'grass_debug_{idx:06d}.png'
+            cv2.imwrite(str(png_path), cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+        if self._grass_heatmap_dir is not None:
+            g_sim_np = payload.get('grass_sim_np')  # (H, W) or None
+            if g_sim_np is not None:
+                H, W = rgb.shape[:2]
+                if g_sim_np.shape != (H, W):
+                    g_sim_np = cv2.resize(g_sim_np, (W, H), interpolation=cv2.INTER_LINEAR)
+                high_mask = g_sim_np >= self._grass_sim_threshold
+                hm_img = rgb.copy()
+                if high_mask.any():
+                    # Normalise within the masked pixels only, so the colormap
+                    # always spans purple→red across exactly the visible region.
+                    high_vals = g_sim_np[high_mask]
+                    val_min = float(high_vals.min())
+                    val_max = float(high_vals.max())
+                    norm_map = np.clip(
+                        (g_sim_np - val_min) / max(val_max - val_min, 1e-6),
+                        0.0, 1.0,
+                    )
+                    lut_idx_map = np.clip(
+                        (norm_map * (_RVIZ_RAINBOW_LUT.shape[0] - 1)).round().astype(np.int32),
+                        0, _RVIZ_RAINBOW_LUT.shape[0] - 1,
+                    )
+                    heat_u8 = (_RVIZ_RAINBOW_LUT[lut_idx_map] * 255.0).astype(np.uint8)
+                    masked = high_mask[..., None]
+                    hm_img = np.where(
+                        masked,
+                        (hm_img.astype(np.float32) * 0.58
+                         + heat_u8.astype(np.float32) * 0.42).astype(np.uint8),
+                        hm_img,
+                    )
+                hm_path = self._grass_heatmap_dir / f'grass_heatmap_{idx:06d}.png'
+                cv2.imwrite(str(hm_path), cv2.cvtColor(hm_img, cv2.COLOR_RGB2BGR))
+
     # ── Frontier-layer debug saver (parallel to the car saver) ──────────
 
     def _enqueue_frontier_debug_save(
@@ -2472,6 +3381,7 @@ class OdinNavGraphNode(Node):
             'score_min':      float(score_min),
             'score_max':      float(score_max),
             'high_std_k':     float(self._frontier_debug_high_std_k),
+            'show_heatmap':   bool(self._frontier_debug_show_heatmap),
             'idx':            int(idx),
         }
 
@@ -2535,8 +3445,9 @@ class OdinNavGraphNode(Node):
         edge_uvs = payload['edge_uvs']
         score_min = payload['score_min']
         score_max = payload['score_max']
-        high_std_k = payload['high_std_k']
-        idx = payload['idx']
+        high_std_k   = payload['high_std_k']
+        show_heatmap = payload['show_heatmap']
+        idx          = payload['idx']
 
         img = rgb.copy()
         H, W = img.shape[:2]
@@ -2544,49 +3455,29 @@ class OdinNavGraphNode(Node):
         n_lut = lut.shape[0]
         span = max(score_max - score_min, 1e-6)
 
-        # ── Heatmap: ONLY high-scoring pixels get tinted.  Threshold is
-        # the per-frame mean + k·std of the raw ExploRFM map, so the
-        # "high" set scales with image content rather than a fixed cutoff.
-        # Colour inside the patch is normalised to the PATCH's own
-        # [min, max] (the dimmest high pixel → blue, the brightest → red)
-        # so the rainbow spans the full LUT instead of clamping the whole
-        # patch to red.  The two scales (patch heatmap vs. persistent node
-        # score) get separate legend bars below.
-        patch_min: float = float('nan')
-        patch_max: float = float('nan')
-        if front_map_np is not None:
-            if front_map_np.shape != (H, W):
-                front_map_np = cv2.resize(
-                    front_map_np, (W, H), interpolation=cv2.INTER_LINEAR,
-                )
-            f_mean = float(front_map_np.mean())
-            f_std = float(front_map_np.std())
-            thr = f_mean + high_std_k * f_std
-            high_mask = front_map_np > thr
+        # ── Optional heatmap overlay ──────────────────────────────────
+        if show_heatmap and front_map_np is not None:
+            fmap = front_map_np
+            if fmap.shape != (H, W):
+                fmap = cv2.resize(fmap, (W, H), interpolation=cv2.INTER_LINEAR)
+            thr = float(fmap.mean()) + high_std_k * float(fmap.std())
+            high_mask = fmap > thr
             if high_mask.any():
-                high_vals = front_map_np[high_mask]
-                patch_min = float(high_vals.min())
-                patch_max = float(high_vals.max())
-                patch_span = max(patch_max - patch_min, 1e-6)
-                norm_map = np.clip(
-                    (front_map_np - patch_min) / patch_span, 0.0, 1.0,
-                )
+                high_vals = fmap[high_mask]
+                patch_span = max(float(high_vals.max()) - float(high_vals.min()), 1e-6)
+                norm_map = np.clip((fmap - float(high_vals.min())) / patch_span, 0.0, 1.0)
                 lut_idx_map = np.clip(
-                    (norm_map * (n_lut - 1)).round().astype(np.int32),
-                    0, n_lut - 1,
-                )
+                    (norm_map * (n_lut - 1)).round().astype(np.int32), 0, n_lut - 1)
                 heat_u8 = (lut[lut_idx_map] * 255.0).astype(np.uint8)
-                alpha = 0.6
                 masked = high_mask[..., None]
                 img = np.where(
                     masked,
-                    (img.astype(np.float32) * (1.0 - alpha)
-                     + heat_u8.astype(np.float32) * alpha).astype(np.uint8),
+                    (img.astype(np.float32) * 0.4
+                     + heat_u8.astype(np.float32) * 0.6).astype(np.uint8),
                     img,
                 )
 
-        # ── Edges between visible nodes — drawn above the heatmap but
-        # below the node dots so the lines don't cover the markers.
+        # ── Edges between visible nodes.
         for u0, v0, u1, v1 in edge_uvs:
             cv2.line(img, (int(u0), int(v0)), (int(u1), int(v1)),
                      (255, 255, 255), 2)
@@ -2597,21 +3488,29 @@ class OdinNavGraphNode(Node):
             cv2.circle(img, center, 8, (255, 0, 0), -1)
             cv2.circle(img, center, 8, (0, 0, 0), 1)
 
-        # ── Frontier nodes: HOLLOW rings coloured by persistent score.
-        # Thick coloured outline + thin black contrast rings so the ring
-        # reads against both bright and dark backgrounds.
+        # ── Frontier nodes: white-filled circle + coloured ring + score text.
+        _FRONT_R = 28
+        _FRONT_RING_T = 5
+        _FRONT_INNER_R = _FRONT_R - _FRONT_RING_T
         if front_u.size > 0:
             lut_idx = np.clip(
-                (frontier_norm * (n_lut - 1)).round().astype(int),
+                ((1.0 - frontier_norm) * (n_lut - 1)).round().astype(int),
                 0, n_lut - 1,
             )
             colors_rgb = (lut[lut_idx] * 255.0).astype(np.uint8)
-            for u, v, c in zip(front_u, front_v, colors_rgb):
+            for u, v, c, norm_val in zip(front_u, front_v, colors_rgb, frontier_norm):
                 center = (int(u), int(v))
                 color_t = (int(c[0]), int(c[1]), int(c[2]))
-                cv2.circle(img, center, 14, color_t, thickness=3)
-                cv2.circle(img, center, 16, (0, 0, 0), 1)
-                cv2.circle(img, center, 11, (0, 0, 0), 1)
+                cv2.circle(img, center, _FRONT_INNER_R, (255, 255, 255), -1)
+                cv2.circle(img, center, _FRONT_R, color_t, thickness=_FRONT_RING_T)
+                cv2.circle(img, center, _FRONT_R + 2, (0, 0, 0), 1)
+                cv2.circle(img, center, _FRONT_INNER_R - 1, (0, 0, 0), 1)
+                label = f'{float(norm_val):.1f}'
+                (tw, th), _ = cv2.getTextSize(
+                    label, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)
+                cv2.putText(img, label,
+                            (center[0] - tw // 2, center[1] + th // 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 0, 0), 1, cv2.LINE_AA)
 
         # ── Legend: rainbow bar with score_min / score_max labels.
         bar_w = 240
@@ -2619,7 +3518,7 @@ class OdinNavGraphNode(Node):
         pad = 20
         x1 = max(0, W - pad - bar_w)
         y1 = pad + 22  # leave room for title above
-        gradient_idx = np.linspace(0, n_lut - 1, bar_w).astype(np.int32)
+        gradient_idx = np.linspace(n_lut - 1, 0, bar_w).astype(np.int32)
         bar_strip = (lut[gradient_idx] * 255.0).astype(np.uint8)
         bar = np.tile(bar_strip[None, :, :], (bar_h, 1, 1))
         img[y1:y1 + bar_h, x1:x1 + bar_w] = bar
@@ -2766,7 +3665,7 @@ class OdinNavGraphNode(Node):
                 edges_out.append({
                     'node_id_0': int(edge_ids[k, 0]),
                     'node_id_1': int(edge_ids[k, 1]),
-                    'weight':    float(edge_w[k]) if k < edge_w.shape[0] else float('nan'),
+                    'weight':    _finite_or_none(float(edge_w[k]) if k < edge_w.shape[0] else float('nan')),
                 })
 
             from datetime import datetime, timezone
@@ -2780,8 +3679,10 @@ class OdinNavGraphNode(Node):
                 'nodes':       nodes_out,
                 'edges':       edges_out,
             }
-            with open(self._graph_snapshot_path, 'w') as f:
+            tmp = self._graph_snapshot_path.with_suffix('.tmp')
+            with open(tmp, 'w') as f:
                 json.dump(payload, f, indent=2)
+            os.replace(tmp, self._graph_snapshot_path)
             self.get_logger().info(
                 f'Final graph snapshot written: {self._graph_snapshot_path} '
                 f'({n_total} nodes, {edge_ids.shape[0]} edges)'
@@ -2801,6 +3702,29 @@ class OdinNavGraphNode(Node):
         except Exception:
             pass
 
+    def save_global_occ_map(self) -> None:
+        """Flush the background accumulator and write the global occupancy map.
+
+        Saves both ``global_occ_map.npz`` (grid + georeferencing metadata) and
+        ``global_occ_map.png`` (white=free, black=occupied, gray=unknown, north up)
+        into the same directory as the graph snapshot.
+        """
+        try:
+            self._global_occ_map.shutdown()  # flush queue + stop worker
+            if self._graph_snapshot_path is None:
+                return
+            out_dir = self._graph_snapshot_path.parent
+            npz_path, png_path = self._global_occ_map.save(out_dir, name='global_occ_map')
+            if npz_path is not None:
+                self.get_logger().info(
+                    f'Global occ map written: {npz_path} + {png_path}'
+                )
+        except Exception as exc:
+            import traceback
+            self.get_logger().error(
+                f'save_global_occ_map failed: {exc}\n{traceback.format_exc()}'
+            )
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -2813,6 +3737,10 @@ def main(args=None):
         # KeyboardInterrupt or exception inside spin().
         try:
             node.save_final_graph_snapshot()
+        except Exception:
+            pass
+        try:
+            node.save_global_occ_map()
         except Exception:
             pass
         try:

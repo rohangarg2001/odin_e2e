@@ -1,0 +1,622 @@
+\documentclass{article}
+\usepackage{booktabs}
+\usepackage{makecell} 
+\usepackage{threeparttable} 
+\usepackage{graphicx} 
+\usepackage{wrapfig}
+\newcommand{\jonas}[1]{{\color{red} Jonas: #1}}
+\newcommand{\rohan}[1]{{\color{blue} Rohan: #1}}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{wasysym}
+\usepackage{xcolor}
+\usepackage{corl_2026} % Use this for the initial submission.
+\usepackage{xspace}
+\usepackage{subcaption} % replaced subfigure with subcaption for subfigure environment support
+% \usepackage[final]{corl_2026} % Uncomment for the camera-ready ``final'' version.
+%\usepackage[preprint]{corl_2026} % Uncomment for pre-prints (e.g., arxiv); This is like ``final'', but will remove the CORL footnote.
+\usepackage[table]{xcolor}
+\usepackage{pifont}
+\usepackage{svg}
+\usepackage[font=small]{caption}
+\usepackage{wrapfig}
+\usepackage{float}
+% Define custom macros for easy data entry
+% \title{{GPU-Accelerated Navigation Graphs for Robot Navigation and End-to-End RGB-to-Graph Prediction}}
+\title{GGraph: A GPU-Accelerated Graph Library for Navigation and End-to-End RGB-to-Graph Learning}
+% Navigation Graph on GPU 
+% The \author macro works with any number of authors. There are two
+% commands used to separate the names and addresses of multiple
+% authors: \And and \AND.
+%
+% Using \And between authors leaves it to LaTeX to determine where to
+% break the lines. Using \AND forces a line break at that point. So,
+% if LaTeX puts 3 of 4 authors names on the first line, and the last
+% on the second line, try using \AND instead of \And before the third
+% author name.
+
+% NOTE: authors will be visible only in the camera-ready and preprint versions (i.e., when using the option 'final' or 'preprint'). 
+% 	For the initial submission the authors will be anonymized.
+\author{
+  Jane E.~Doe\\
+  Department of Electrical Engineering and Computer Sciences\\
+  University of California Berkeley 
+  United States\\
+  \texttt{janedoe@berkeley.edu} \\
+  %% examples of more authors
+  %% \And
+  %% Coauthor \\
+  %% Affiliation \\
+  %% Address \\
+  %% \texttt{email} \\
+  %% \AND
+  %% Coauthor \\
+  %% Affiliation \\
+  %% Address \\
+  %% \texttt{email} \\
+  %% \And
+  %% Coauthor \\
+  %% Affiliation \\
+  %% Address \\
+  %% \texttt{email} \\
+  %% \And
+  %% Coauthor \\
+  %% Affiliation \\
+  %% Address \\
+  %% \texttt{email} \\
+}
+\usepackage{xcolor}
+\definecolor{ggcolor}{RGB}{36,44,11}
+\newcommand{\sysname}{\textcolor{ggcolor}{\textsc{GGraph}}\xspace}
+\newcommand{\swaggername}{\textsc{SWAGGER + NetworkX}\xspace}
+\newcommand{\dlname}{RGB-to-Graph model\xspace}
+\newcommand{\todo}[1]{\textcolor{red}{\textbf{[TODO: #1]}}}
+\newcommand{\msec}[1]{\,\text{ms}}
+\newcommand{\fps}{\,\text{Hz}}
+\hypersetup{colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue}
+
+\begin{document}
+\maketitle
+
+%===============================================================================
+
+\begin{abstract} Autonomous mobile robots require rich, efficient spatial representations to navigate; graphs naturally fulfill this need by providing a sparse, flexible structure capable of storing semantic data. Current open-source graph libraries support exclusively robot deployment code or enable graph-based learning approaches. 
+We introduce \sysname, an open-source, GPU-accelerated graph library that unifies robotic deployment and learning. It targets real robots via ROS2 interfaces as well as vectorized GPU-based policy training, supporting tasks such as 3D navigation, exploration, and loop-closure integration off-the-shelf.
+Individual operations scale to graphs with millions of nodes and run efficiently across parallel environments, enabling large-scale deployment and training. \sysname supports the fusion of flexible per-node attributes such as traversability, semantics, and latent features for comprehensive scene understanding. In addition to geometry-based graph construction, it enables training a novel approach for predicting and incrementally building 3D navigation graphs purely from posed RGB images. We demonstrate \sysname's capabilities through both simulations and real-world experiments on a variety of robotic tasks.
+\end{abstract}
+% Two or three meaningful keywords should be added here
+\keywords{Robot navigation and locomotion, learning and planning in robotics} 
+
+%===============================================================================
+
+\section{Introduction}
+% Design tools have driven progress in different parts/stacks of robotics. Notable examples areoccupancy grid mapping for 2-D planning, GPU elevation mapping for legged locomotion \citep{fankhauser2018elevation,miki2022elevation}, ESDFs for collision-aware optimization \citep{oleynikova2017voxblox,han2019fiesta}, perception libraries such as OpenCV \citep{opencv_library}, and physics simulators such as Isaac Gym \citep{makoviychuk2021isaac} and MuJuCo \citep{todorov2012mujoco} for parallel reinforcement learning.
+% Progress in mobile robotics has been driven by a set of \emph{design tools} that have become foundational infrastructure across the autonomy stack: occupancy grids for 2-D planning, GPU elevation mapping for legged locomotion \citep{fankhauser2018elevation,miki2022elevation}, ESDFs for collision-aware optimization \citep{oleynikova2017voxblox,han2019fiesta}, OpenCV \citep{opencv_library} for perception, PyTorch \citep{paszke2019pytorch} for deep learning, and physics simulators such as Isaac Gym \citep{makoviychuk2021isaac} and MuJoCo \citep{todorov2012mujoco} for parallel reinforcement learning. Similarly, on the deployment side navigation has established its own standard tools: open-source exploration libraries like TARE \citep{tare} set the state-of-the-art for geometric-based planning, while simulators like Habitat \citep{puig2023habitat3} and large-scale open-source real-world RGB datasets provide parallel data needed to train learning-based policies \citep{shah2023gnm, karnan2022sociallycompliantnavigationdataset}. While geometric exploration frameworks natively rely on graph structures, most field-deployed learning-based navigation policies are conditioned on images instead of graphs. Graphs provide a natural representation for learning long-horizon navigation \citep{savinov2018sptm, chaplot2020neural} and semantic memory \citep{armeni20193dscenegraph,hughes2022hydra,gu2023conceptgraphs,werby2024hovsg}. While some recent DRL approaches attempt to leverage graphs for navigation, they are restricted to statically pre-computing graphs offline over small-scale datasets rather than building them dynamically online \citep{cao2024deep, 11397167}. This is because graph libraries used in robotics are implemented in Python or C++ on the CPU, making them unsuited for parallel training environments. Scaling graph operations for contemporary learning methods, such as batching 64 simulated environments or generating massive graph datasets, is therefore highly impractical. Because existing GPU-accelerated frameworks like cuGraph and PyG~\cite{fey2019pyg} lack native support for the spatial graph mutations required in robotics, this scale requires re-implementing fundamental operations from scratch, a process that is notoriously complex and difficult to maintain. The development of \sysname was motivated by precisely this constraint. Replacing the graph stage with a GPU-resident equivalent raised the system throughput above sensor rate. This observation underpins the central thesis of this work: \emph{the absence of a modular, parallelizable, and low-latency design tool is a major obstacle to adopting graph-based primary representations in mobile-robot learning}.
+
+Progress in mobile robotics has been driven by a set of \emph{design tools} that form the foundation of the autonomy stack: occupancy grids for 2-D planning, GPU elevation mapping \citep{fankhauser2018elevation,miki2022elevation} for legged locomotion, OpenCV \citep{opencv_library} for perception, PyTorch \cite{DBLP:journals/corr/abs-1912-01703} for deep learning, and physics simulators such as Isaac Gym \citep{makoviychuk2021isaac} and MuJoCo \citep{todorov2012mujoco} for parallel reinforcement learning. Within the autonomy stack, navigation has its own standard tools: open-source libraries such as Nav2 \cite{macenski2020marathon2}, OMPL \cite{sucan2012the-open-motion-planning-library}, and TARE \citep{tare} unified much of the deployment code for the low-compute regime of onboard CPUs. These geometric navigation systems depend on graphs to represent the world, which makes graphs equally natural for learning long-horizon navigation \citep{savinov2018sptm, chaplot2020neural} and semantic memory \citep{armeni20193dscenegraph,hughes2022hydra,gu2023conceptgraphs,werby2024hovsg}. While recent DRL approaches \citep{cao2024deep, 11397167} leverage graphs for navigation, they are limited to small grid worlds and 16 parallel environments during training, relying on Ray \cite{moritz2018raydistributedframeworkemerging} to launch Python graph environments in parallel.
+Longer-horizon planning sharpens these limits, demanding larger graphs, more parallel environments, and ingestion of real-world data into the same representation. GPU-accelerated graph libraries such as PyTorch Geometric \citep{fey2019pyg} and cuGraph address the throughput gap and support flexible per-node attributes, but assume \emph{static} graphs: graphs that are constructed once and consumed by a model, rather than incrementally grown or merged during roll-outs. Consequently, the operations that field-deployed navigation depends on, such as loop-closure-driven full-graph adjustment (as in GBPlanner \citep{gb_planner}) and frontier maintenance and exploration (as in TARE \cite{tare}), have no off-the-shelf support on the learning side.
+
+We introduce \sysname, a GPU-resident graph library that serves as a single \emph{design tool} for both deployment and learning. \sysname provides the dynamic, robotics-specific operations expected of a deployment stack: incremental node and edge insertion, loop-closure-driven graph adjustment, frontier and traversability layers, exploration heuristics, and ROS2 interfaces, while running entirely on the GPU, supporting flexible per-node attribute layers, and scaling to millions of nodes across batched parallel environments. In summary, our contributions are:
+\begin{enumerate}
+\item \textbf{An open-source, batched, GPU-accelerated graph library} for robotic deployment and learning that generates collision-free graphs from occupancy grids or elevation maps across parallel environments using batched-GPU operations.
+\item \textbf{An extensible layer system for graph scoring} that provides a compact API for attaching geometric, semantic, learned, or VLM-derived scores to each node, with native support for asynchronous external observations and a configurable family of merge policies. An information-gain exploration layer is included as a built-in example and is used in our robot deployment for the DARPA TIAMAT challenge.
+\item \textbf{An end-to-end RGB-to-Graph model} trained on graphs generated at dataset scale by the \sysname pipeline from the Grand Tour dataset \cite{grandtour}. To our knowledge, this is the first end-to-end prediction of navigation graphs from posed RGB images alone.
+\end{enumerate}
+
+% \sysname provides three operational modes that share a common core: a single-frame \emph{local} graph (suitable for one-shot RL observations), an \emph{incremental global} graph that fuses local observations across time (capable of real-time, long-horizon exploration even on the restricted hardware of a physical quadruped), and a \emph{batched} mode that exposes graphs as padded GPU tensors for vectorized RL training. All three modes are evaluated in simulation and hardware tests; the resulting graphs are directly usable as GNN inputs, as supervision for foundation models, and as input to classical planners.
+% \jonas{the current story line lacks a clear objective and should lead to a clear need in community. I think this should be clearly motivated based on design tools in robotics for learning. Motivation better design tools better learning based approaches can be build up ontop - example would be elevation map - occupancy mapping in ROS2 for navigation planning. 
+% advantages of graph representation - 
+% make compelling comparision of graphs for mobile systems but also for capturing semantic relationships (this is clear in ML community a lot of knoweldge graph and graph-based leanring appraoches avaialble but not yet fully accelerated within mobile robotics due to missing design tools. 
+% however lack of design tools available design for a learning context (graphs remain generally hard to maintain - non-parallized/non-accalerated and complex from user).
+
+% Introducing a graph library efficiently support navigation, exploration and variety of leanring applicaiton. Specifcally we showcase training a foundation model for leanring graphs from RGB images for navigation.  
+% - which can generate and refiner and compose graphs
+% - also support classical large scale navigation 
+% - support large scale exploration while real-time capable on restricted hardware
+% }
+
+\begin{figure}[t]
+    \centering
+    
+        \includegraphics[page=1, width=\columnwidth, trim=35pt 01pt 35pt 12pt, clip]{images/Figures.pdf}
+        \caption{Highlight figure}
+        
+    
+    \label{fig:both}
+\end{figure}
+\vspace{12px}
+%===============================================================================
+\section{Related Works}
+\label{sec:related_works}
+
+\subsection{Representations for Navigation} 
+
+
+\subsection{Graphs for Learning}
+Graph Neural Networks have become the standard architecture for representing data in non-Euclidean spaces, achieving state-of-the-art results in molecular property prediction for drug discovery, large-scale recommender systems, and traffic forecasting \cite{wu2020gnnsurvey}. Chen et al.\ \cite{chen2020autonomousexplorationuncertaintydeep} were among the first to cast autonomous exploration as a decision-making problem in which the best action over the graph is selected using GNNs together with DRL. ARiADNE \cite{cao2023ariadnereinforcementlearningapproach} proposed an attention-based neural network policy that outperformed frontier-based planners. More recent work by Cao et al.\ \cite{cao2024deep} reports better exploration efficiency and lower compute times than the state-of-the-art TARE \cite{tare}. A severe limitation of these methods is that they were trained on environments with grid sizes of $640 \times 480$ and could only train with 16 parallel environments using a multi-threaded Python implementation.
+\subsection{Graph Libraries / Ecosystem}
+The software ecosystem for graph processing is broadly divided into three domains: autonomous navigation, graph machine learning, and static data analytics. In autonomous navigation, planners that use graphs for representation, require graph mutations, such as fusing local observations into a global graph, and have historically relied on closed source code alongside open-source libraries in both C++ and Python \cite{SciPyProceedings_11}. Notable open-source examples include the TARE planner \cite{tare} and GBPlanner \cite{gb_planner}. More recently, frameworks like SWAGGER \cite{swagger} have utilized GPU tensor operations to sample way-point graphs from occupancy grids for route planning, but because this acceleration is limited to only a small portion of the pipeline, they still ultimately revert to CPU-bound NetworkX representations.
+In the domain of graph machine learning, frameworks like PyG\cite{fey2019pyg} leverage a fully tensorized approach to natively support batched operations, but they are strictly limited to disjoint batching; they process isolated graphs in parallel as a block-diagonal matrix and lack the structure needed to natively merge overlapping graphs in space. For internet-scale data analytics, libraries like cuGraph achieve extreme speeds executing graph algorithms on the GPU but do not natively support batched sequential inputs, requiring the entire graph structure to be computationally rebuilt from scratch to process new data. \\
+Addressing the need for batched spatial graph management, \sysname performs graph fusion entirely on GPU. It further employs a flexible feature-mapping architecture to continuously update custom semantic properties, from frontier metrics to vision-language outputs, maintaining a rich representation of the agent's environment.
+\newcommand{\cmark}{\textcolor{green!70!black}{\ding{51}}} % Darker green tick for readability
+\newcommand{\xmark}{\textcolor{red}{\ding{55}}}            % Red cross
+\newcommand{\otick}{\textcolor{orange}{\ding{51}}}         % Orange tick for partial support
+% \textbf{GPU} & \textbf{Flexibility} & \textbf{Robotics} & \textbf{Learning}
+\begin{table}[h]
+    \centering
+    \begin{threeparttable}
+        \caption{Comparison of different libraries and methods across core capabilities.}
+        \label{tab:method_comparison}
+        \begin{tabular}{lcccc}
+            \toprule
+            \textbf{Library} & 
+            \makecell{\textbf{GPU} \\ \textbf{Accel.}} & 
+            \makecell{\textbf{Spatial Graph} \\ \textbf{Merging}} & 
+            \makecell{\textbf{Robotics Nav} \\ \textbf{and Exploration}} & 
+            \makecell{\textbf{Policy Learning} \\ \textbf{Support}} \\
+            \midrule
+            NetworkX          & \xmark & \xmark & \cmark & \xmark \\
+            cuGraph           & \cmark & \xmark & \xmark & \xmark \\
+            PyTorch Geometric & \cmark & \xmark & \xmark & \cmark \\
+            GBPlanner         & \xmark & \cmark & \cmark & \xmark \\
+            TARE Planner      & \xmark & \cmark & \cmark & \xmark \\
+            SWAGGER           & \otick & \xmark & \cmark & \xmark \\
+            \midrule
+            \sysname (ours)         & \cmark & \cmark\tnote{*} & \cmark & \cmark \\
+            \bottomrule
+        \end{tabular}
+    \begin{tablenotes}
+            \tiny\raggedleft
+            \item \otick~Indicates partial GPU acceleration; *~indicates batch processing support.
+        \end{tablenotes}    
+        \end{threeparttable}
+\end{table}
+\section{\sysname Design and Method}
+\label{sec:problem}
+We consider a mobile ground robot operating in an a priori unknown
+environment. At each timestep $t$, the robot has pose
+$\mathbf{x}_t \in \mathrm{SE}(3)$ and produces a local spatial
+observation $\mathcal{O}_t = \{\mathbf{M}_t, r, \mathbf{x}_t\}$, where
+$\mathbf{M}_t$ is a dense spatial representation of resolution $r$
+centred on $\mathbf{p}_t$ (an occupancy grid, an elevation map, or, in
+the learned variant of Sec.~\ref{sec:rgb2graph_method}, a monocular RGB
+frame $\mathbf{I}_t \in \mathbb{R}^{H_I \times W_I \times 3}$). The
+objective of \sysname is to incrementally maintain a stitched,
+world-frame navigation graph
+$\mathcal{G}_t = (\mathcal{V}_t, \mathcal{E}_t, \mathcal{F}_t, \mathcal{S}_t)
+= f(\mathcal{G}_{t-1}, \mathcal{O}_t)$,
+where $\mathcal{V}_t$ are collision-free waypoints with positions
+$\mathbf{p}_i \in \mathbb{R}^3$, $\mathcal{E}_t$ are collision-free
+transitions consistent with all observations
+$\{\mathcal{O}_\tau\}_{\tau\le t}$, $\mathcal{F}_t \subset \mathbb{R}^3$
+are frontier points on the boundary between known-free and unknown
+space, and $\mathcal{S}_t : \mathcal{V}_t \to \mathbb{R}^L$ is an
+$L$-channel score map carrying geometric, semantic, or learned
+attributes attached to each node.
+
+
+\sysname implements $f$ as a four-stage GPU pipeline. (1)~A CUDA
+frontier kernel scans $\mathbf{M}_t$ in parallel, emitting both a binary
+cost map $\mathcal{C}_t$ and the frontier set
+$\mathcal{F}_t^{\text{loc}}$. (2)~A GPU waypoint sampler converts
+$\mathcal{C}_t$ into a local graph
+$\mathcal{G}_t^{\text{loc}}=(\mathcal{V}_t^{\text{loc}},\mathcal{F}_t^{\text{loc}})$
+of well-spaced free-space nodes. (3)~A tensorised merge step folds
+$\mathcal{G}_t^{\text{loc}}$ into the persistent global graph
+$\mathcal{G}_t$, proposing and verifying edges against a rolling
+obstacle memory. (4)~A stack of \emph{graph layers} writes a per-node
+score tensor $\mathbf{S}_t \in \mathbb{R}^{N\times L}$, combining
+on-graph computation with asynchronous external observations.
+
+\textbf{Local Graph Construction}
+The frontier kernel scans the input map in parallel, emitting both a
+binarised free-space mask and the frontier set in a single pass. The
+waypoint sampler then populates this mask with well-spaced nodes
+through two complementary passes: a \emph{boundary} pass places nodes
+along inflated obstacle contours to cover corridors and walls, and a
+\emph{free-space} pass uses a GPU distance transform to fill open
+regions until every free pixel lies within a fixed radius of some
+node. For 2.5-D elevation inputs, a slope and step-height fusion
+stage lifts the map into a 3-D traversability volume before sampling,
+which is what allows the same pipeline to produce 3-D graphs over
+staircases, ramps, and multi-floor buildings without a bespoke 3-D
+sampler.
+
+\textbf{Global Graph Assembly}
+Each frame's local graph is folded into the global graph by a single
+batched nearest-neighbour assignment: every local node is either
+snapped to an existing global node or appended with a fresh stable
+ID. Candidate edges are proposed by a 3-D radius query and validated
+against a rolling obstacle memory using GPU-parallel line-of-sight
+checks, with surviving edges added subject to a per-node degree cap.
+A retention mechanism probabilistically prunes nodes that have not
+been observed recently, bounding graph size over long missions.
+
+\textbf{Multi-Layer Attribute System}
+Per-node attributes (geometric, semantic, or learned) are exposed
+via a stack of registered \emph{graph layers}. A \emph{compute layer}
+executes a user kernel against the current graph each frame, while an
+\emph{external layer} ingests asynchronous scores from outside the
+library and persists them across frames. A small set of merge
+policies (overwrite, blend, exponential moving average) governs how
+repeated observations of the same node combine, letting the same
+abstraction host transient one-shot signals as well as slowly
+accumulating beliefs. Because every layer is a GPU tensor aligned to
+the node array, its output is consumed without copies as either a
+per-node feature matrix for a GNN policy or a scalar score for a
+classical planner.
+
+\textbf{Loop Closure}
+Each node stores the index of the odometry frame at which it was
+created. When an external place-recognition module supplies a
+corrected trajectory, graph correction reduces to a single $O(N)$
+vectorised gather that translates each node by the displacement of
+its parent frame, with no graph traversal, no sensor re-integration,
+and no occupancy reprojection. A subsequent GPU node remerge
+collapses spatially coincident nodes from overlapping traversals, and
+a frontier validity recheck demotes boundary nodes that the
+correction has rendered interior.
+
+\textbf{GPU Graph Search}
+For downstream planning, the global graph is materialised in CSR form
+directly from the edge tensors without leaving the GPU. \sysname
+provides parallel BFS for unweighted reachability queries and a
+Bellman--Ford relaxation kernel for shortest paths under non-uniform
+edge weights. We use Bellman--Ford rather than Dijkstra because its
+outer loop relaxes all edges in parallel each iteration, mapping
+naturally onto a single GPU launch, whereas Dijkstra's priority-queue
+extraction forces serialisation.
+
+\textbf{Batched Parallel Execution}
+For policy training, $B$ independent builders share the same kernels
+and are stepped together each simulator tick, producing padded
+position and adjacency tensors that GNN-conditioned policies in
+IsaacLab, IsaacGym, or Habitat consume directly. Because
+per-environment graph state is itself GPU-resident, only kernel
+saturation, and not Python or PCIe overhead, bounds the batch size.
+
+\textbf{ROS2 Deployment}
+\label{sec:overview}
+A ROS2 wrapper subscribes to a sensor stream and odometry,
+accumulates returns into a rolling elevation map centred on the
+latest pose, and feeds the result to the incremental builder. The wrapper also exposes the layer system,
+allowing external modules to publish per-position score updates that
+route into the appropriate external layer without bespoke
+serialisation.
+
+\subsection{End-to-End RGB-to-Graph Prediction}
+\label{sec:rgb2graph_method}
+
+
+
+
+
+\begin{wrapfigure}{r}{0.6\columnwidth}
+    \vspace{-0.8em}
+    \centering
+    \includegraphics[width=0.6\columnwidth, trim=0pt 72pt 0pt 5pt, clip]{images/model_Archi.pdf}
+    \caption{\small \textbf{RGB-to-Graph model architecture.} A
+    Depth-Anything-V2 backbone feeds a heatmap head (per-pixel
+    traversability) and a depth-conditioned position head (per-pixel
+    3-D coordinates). At inference, heatmap pixels above a threshold
+    are Poisson-disk sampled and their predicted positions are merged
+    into \sysname's global graph.}
+    \label{fig:rgb2graph_arch}
+    \vspace{-1.5em}
+\end{wrapfigure}
+\textbf{Supervision from \sysname.}
+The geometry-based graph construction pipeline of Sec.~\ref{sec:overview} provides
+the supervision needed to train a purely image-conditioned graph
+predictor. We run the standard \sysname pipeline offline on the Grand Tour dataset using its RGB and LiDAR streams, project the resulting traversable nodes back into the
+camera frame, and store their image pixels and metric 3-D positions as
+per-frame targets. This converts hours of robot traversal into
+supervision signals without any human labelling.
+
+\textbf{Architecture.}
+The predictor is a dense per-pixel model built on a Depth-Anything-V2
+(DA-V2)~\cite{yang2024depthv2} backbone, which exposes both a fused
+feature map and a relative monocular depth map. Two conv heads share
+this representation: a \emph{heatmap head} that produces a per-pixel
+traversability score, and a \emph{position head} that, taking the
+standardised depth map as an additional input channel, regresses the
+corresponding 3-D node coordinate. Depth conditioning anchors the
+metric regression on the monocular prior, and we evaluate both the
+ViT-S and ViT-B variants of DA-V2. At deployment, edges are added
+between local nodes whose connecting line is traversable in the
+heatmap; because every operation runs on the GPU, the same downstream
+merging operations as the geometric pipeline apply unchanged.
+
+
+\textbf{Training.}
+The heatmap head is trained with an adaptive weighted BCE in which
+each non-node pixel's negative weight $w_p^{-}$ is the maximum of two
+cues: feature dissimilarity to the GT nodes, and distance from the
+nearest GT node \emph{normalised by the local node spacing in that
+pixel's region}:
+\begin{equation}
+\mathcal{L}_{\text{hm}} =
+\tfrac{1}{Z}\sum_{p}\bigl(w^{+}_{p}\mathbf{g}_p + w^{-}_{p}(1-\mathbf{g}_p)\bigr)\,
+\mathrm{BCE}(\hat{h}_p,\mathbf{g}_p),
+\end{equation}
+where $\hat{h}_p \in [0,1]$ is the predicted traversability probability
+at pixel $p$ (the sigmoid of the heatmap head's logit),
+$\mathbf{g}\in[0,1]$ is a Gaussian indicator over the GT node pixels,
+and $Z$ normalises the weight sum. Local-spacing normalisation
+is critical: nodes are naturally sparse near the camera and dense far
+away, so a global threshold would erode legitimate near-field floor
+while leaving thin structures (legs, poles) unpunished. The position
+head is supervised with a Smooth-L1 loss against the GT positions
+sampled at the node pixels.
+
+
+
+
+\section{Experiments}
+
+
+% To evaluate our navigation graph library and address these questions, we benchmarked our method against an existing open-source Python graph library (NetworkX) and a CPU-bound PyTorch implementation of our tensorized method.
+
+\subsection{Computational Efficiency and Dataset Scalability}
+\begin{wrapfigure}{r}{0.5\columnwidth}
+    \vspace{-0.8em}
+    \centering
+    \includegraphics[width=0.5\columnwidth]{images/Experiment/Scalability/26_pipeline_comparison_twin_axis.pdf}
+    \caption{\small Per-frame pipeline time in a single environment as the global graph grows to $100K$ nodes. \sysname is constant in graph size, while the baseline (${\sim}20\times$) grows linearly.}
+    \label{fig:env_1_timing}
+    \vspace{-1.5em}
+\end{wrapfigure}
+
+To quantify the speedup obtained by \sysname on individual and batched operations, we benchmark it against a CPU-bound baseline that uses SWAGGER \cite{swagger} to construct a NetworkX \cite{SciPyProceedings_11} graph from a local occupancy grid (with nodes in free space and collision-free edges) and then applies the same merge operations as \sysname against a preexisting global graph, but implemented in Python and optimised for CPU execution. The setup mirrors downstream navigation workloads: a simulated robot traverses random obstacles and processes a $128 \times 128$ local occupancy grid per frame. We continuously measure the wall-clock time required to extract and merge each local graph into the global topology. To capture peak algorithmic latency, we simulate until the graph reaches $20{,}000$ nodes and average the execution time over the final $10$ frames. To demonstrate vectorised training capabilities, we scale this procedure across multiple parallel environments.
+\begin{wraptable}{r}{0.42\textwidth}
+    \vspace{-0.8em}
+    \centering
+    \scriptsize
+    \setlength{\tabcolsep}{4pt}
+    \begin{tabular}{r r r r}
+        \toprule
+        $B$ & \sysname (ms) & CPU (ms) & Speedup \\
+        \midrule
+        1    &  4.76  &   11.21  &  2.4$\times$ \\
+        4    &  4.85  &   53.35  & 11.0$\times$ \\
+        8    &  4.92  &  111  & 22.6$\times$ \\
+        32   &  6.14  &  457  & 74.3$\times$ \\
+        64   &  7.71  &  946  & 122.6$\times$ \\
+        128  & 11.61  &  1950  & $^*168.0\times$ \\
+        256  & 18.87  &  3978  & $^*210.8\times$ \\
+        512  & 33.99  &  8432  & $^*248.0\times$ \\
+        \midrule
+        1024 & 65.73  & 16985  & $^*258.4\times$ \\
+        \bottomrule
+        \multicolumn{4}{l}{\scriptsize *SWAGGER extrapolated beyond $B{=}128$.}
+    \end{tabular}
+    \caption{The speedup achieved by \sysname begins to plateau around $B=512$.}
+    \label{tab:batched_wall_time}
+    \vspace{-2.6em}
+\end{wraptable}
+
+Figure~\ref{fig:env_1_timing} shows that \sysname's per-frame time stays roughly constant as the global graph grows, whereas the CPU baseline scales linearly with the number of nodes. Table~\ref{tab:batched_wall_time} extends the same comparison to parallel environments: \sysname's wall time is essentially flat for small batches and only starts to rise once the GPU kernels saturate.
+% \subsubsection{Latency during excecution of the entire graph libray}
+% Another time of execution which is measured is that how time does our library take to run the entire pipeline, for this we use a similar setup as to one above one where we now simulate randomly generted similar dimension of the local graph which is observed by the robot as it moves in an simulated environment. The library is now tasked with maintaining the global graph representation, sampling edges between the nodes using a certain heurisitc while checking for collision checking. In this experiment we will first show how much the method can scale for the nodes for just one environment as compared to our method running on PyTorch CPU as compared to GPU.   
+% In order to evaluate the increase in speed of GPU-NavGraph to the baselines, we compared the processing time SWAGGER and our library takes on forming a local graph on simulated costmaps as the number of nodes or local costmap size increases.
+% To compare the performance of the GPU based library to a CPU based one, we run synthetic experiments to stress test the library in cpu and gpu modes. We continuously streamed 10\,m $\times$ 10\,m local occupancy grids and odometry data from an agent navigating a dense, randomized environment with obstacles. We tracked the processing time required to update and merge the global graph at each frame, scaling the environment until the representation reached 100,000 nodes. 
+
+% \subsection{Dataset Scalability}
+% The following figure shows how the computation scales as the number of parallel environments ingesting simulated data and generating graphs increases.
+\subsection{Navigation and Exploration}
+% metrics: Graph-based subterranean exploration path planning using aerial and legged robots
+% environment / sim 
+% baseline ? 
+To validate the usability and effectiveness of our library for exploration and navigation, we ran exploration in an a priori unknown course in IsaacSim, providing \sysname with simulator odometry and a local costmap from a terrain-mapping library.
+
+\begin{figure}[t]
+    \centering
+    \begin{subfigure}[b]{0.502\columnwidth}
+        \centering
+        \includegraphics[page=1, width=\linewidth, trim=0pt 0pt 40pt 0pt, clip]{images/tiamat_exp.pdf}
+        \caption{Coverage over time.}
+        \label{fig:exploration_coverage}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.240\columnwidth}
+        \centering
+        \includegraphics[page=2, width=\linewidth, trim=0pt 0pt 400pt 10pt, clip]{images/tiamat_exp.pdf}
+        \caption{Greedy strategy.}
+        \label{fig:exploration_greedy}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.240\columnwidth}
+        \centering
+        \includegraphics[page=3, width=\linewidth, trim=0pt 0pt 400pt 10pt, clip]{images/tiamat_exp.pdf}
+        \caption{Past-path avoidance.}
+        \label{fig:exploration_pastpath}
+    \end{subfigure}
+    \caption{Both heuristics, implemented as separate node-attribute layers, fully explore the environment. \textbf{(a)}~Past-path avoidance sustains a higher coverage rate and reaches full coverage $90.5\,\text{s}$ before greedy. \textbf{(b)}~The greedy trajectory repeatedly re-enters explored space. \textbf{(c)}~Past-path avoidance penalises visited nodes, producing a more efficient sweep.}
+    \label{fig:exploration}
+\end{figure}
+
+
+
+\textbf{Exploration in IsaacSim.}
+To test whether \sysname can be used for downstream robotic deployment, we ran simulations in IsaacSim with a Spot robot whose local costmap was provided by an open-source terrain-mapping library~\cite{tare}. We evaluated two courses, \texttt{Camping} (a campsite beside army barracks) and \texttt{Hospital} (a default IsaacSim indoor scene), and implemented two heuristic-based exploration strategies, each realised as a separate node-attribute layer from which the exploration target is selected. \emph{Greedy frontier selection} navigates to the nearest geometric frontier, read directly from a binary frontier layer; \emph{past-path avoidance} instead scores nodes by their distance from the traversed path, steering the robot toward less-visited regions. The results in Fig.~\ref{fig:exploration} show that both heuristics complete coverage and validate the correctness of the layering system as well as the usefulness of \sysname for downstream robotics tasks.
+% \begin{wrapfigure}{r}{0.5\columnwidth}
+%     \vspace{-0.8em}
+%     \centering
+%     \includegraphics[width=0.5\columnwidth, trim=0pt 0pt 260pt 5pt, clip, page=1]{images/TIAMAT_RUN.pdf}
+%     \caption{\small Both heuristics, implemented as separate node-attribute layers, fully explore the environment. \textbf{(a)}~Past-path avoidance sustains a higher coverage rate and reaches full coverage $90.5\,\text{s}$ before greedy. \textbf{(b)}~The greedy trajectory repeatedly re-enters explored space. \textbf{(c)}~Past-path avoidance penalises visited nodes, producing a more efficient sweep.}
+%     \label{fig:exploration}
+%     \vspace{-1.5em}
+% \end{wrapfigure}
+
+\begin{wrapfigure}{r}{0.4\columnwidth}
+    \vspace{-0.8em}
+    \centering
+    \includegraphics[width=0.4\columnwidth, trim=0pt 0pt 0pt 5pt, clip]{images/elong_scale18pct_add130mmpm_believed_vs_corrected.pdf}
+    \caption{\small Drifted graph before correction (\emph{left}) versus the
+    corrected graph after a single \sysname loop-closure pass (\emph{right}).}
+    \label{fig:loop_closure}
+    \vspace{-1.5em}
+\end{wrapfigure}
+
+\textbf{Loop Closure Demonstration.}
+We evaluate on a closed square trajectory (side $22\,\text{m}$, $88\,\text{m}$ total) under a combined drift of $22\%$ scale error and $160\,\text{mm\,m}^{-1}$ additive world-frame bias, producing a pre-correction loop-closure gap of $14.08\,\text{m}$. The full correction pipeline completes in $2.26\,\text{ms}$. Such efficiency is not feasible for volumetric representations: an occupancy grid or TSDF over the same environment requires an $O(W{\times}H)$ pixel-level warp followed by re-ray-casting or signed-distance fusion. In \sysname, each node carries the index of the odometry step that placed it, so loop closure reduces to a single vectorised pass.
+
+
+% \subsubsection{Multi Layer Support}
+% To demonstrate the multi-layer support on \sysname, we captured a posed RGB-D sequence of an outdoor scene with a camera with accurate pose tracking and built a navigation graph with three node-attribute layers, shown in Figure~\ref{fig:multi_layer}. The first layer (left) scores each node by its distance along the traversed path from the robot, biasing exploration away from previously visited regions. The second layer (middle) marks geometric frontier nodes on the boundary between explored and unexplored space. The third layer (right) stores a per-node semantic similarity score to the query ``grass,'' obtained from the object-similarity head of the ExploRFM vision module~\cite{shah2026wildosopenvocabularyobjectsearch}; the inset shows the corresponding region of the scene. Because all three layers share a single underlying graph, a downstream policy can fuse path-history, geometric, and semantic cues simply by reading the relevant layers, illustrating how \sysname unifies heterogeneous attributes in one representation.
+% \begin{figure}[h]
+%     \centering
+    
+%         \includegraphics[width = 1\columnwidth, trim=0pt 217pt 0pt 0pt, clip]{images/layers_experiment.pdf}
+%         \caption{Visualization of multi-layer support using GGraph to encone semantics, frontiers and letent features.}
+%         \label{fig:multi_layer}
+    
+    
+%     \vspace{1em}
+    
+% \end{figure}
+\textbf{Multi-Layer Support.}
+We captured a posed RGB-D sequence of an outdoor scene with a pose-tracking camera and built a single navigation graph carrying three node-attribute layers (Fig.~\ref{fig:multi_layer}). Because all three layers share the same underlying graph, a downstream policy can fuse path-history, geometric, and semantic cues simply by reading the relevant layers, illustrating how \sysname unifies heterogeneous attributes in one representation.
+
+
+
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=1\columnwidth, trim=0pt 217pt 0pt 0pt, clip]{images/layers_experiment.pdf}
+    \caption{\textbf{\emph{Left:}} a path-proximity layer scoring each node by its distance from the odometry history. \textbf{\emph{Middle:}} a geometric frontier layer marking nodes on the boundary between explored and unexplored space. \textbf{\emph{Right:}} a semantic layer storing per-node similarity to the query ``grass'' from the object-similarity head of ExploRFM~\cite{shah2026wildosopenvocabularyobjectsearch} to encode traversable yet undesirable regions.}
+    \label{fig:multi_layer}
+\end{figure}
+\subsection{RGB-to-Graph Model Performance}
+\label{sec:rgb2graph_exp}
+
+We evaluate the RGB-to-Graph model along four axes: cross-domain
+generalisation, prediction range, latency, and graph quality for
+downstream planning.
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=\columnwidth, trim=0pt 130pt 0pt 0pt, clip]{images/e2e_domains.pdf}
+    \caption{\small \textbf{Cross-domain qualitative results.}
+    \textbf{(a,\,b)}~Train-set predictions on rugged sloping terrain and
+    indoor environments. \textbf{(c,\,d)}~Validation predictions across
+    curbs, traversable disturbances, and low-light conditions.
+    \textbf{(e,\,f)}~Live hardware tests with predicted edges using a
+    moving Odin1 camera. \textbf{(g,\,h)}~Failure cases: a rock
+    photometrically resembling the road, and floor reflections.}
+    \label{fig:e2e_domains}
+\end{figure}
+
+\begin{wrapfigure}{r}{0.45\columnwidth}
+    \vspace{-4.2em}
+    \centering
+    \includegraphics[width=0.43\columnwidth]{images/timing_breakdown_2.pdf}
+    \caption{\small \textbf{Per-frame latency breakdown.} The geometric
+    \sysname pipeline versus the RGB-to-Graph model with ViT-S and ViT-B
+    backbones, measured on an NVIDIA RTX 5090.}
+    \label{fig:e2e_latency}
+    \vspace{-0.8em}
+\end{wrapfigure}
+
+\textbf{Cross-domain generalisation.}
+Despite being trained on a fixed mission set built from \sysname's
+geometric pipeline, the model predicts coherent traversable graphs on
+training-set outdoor terrain and indoor corridors, on validation scenes
+with curbs, traversable disturbances, and low-light conditions, and on
+live hardware tests with a moving Odin1 camera (Fig.~\ref{fig:e2e_domains}).
+Failure modes cluster around photometric ambiguities.
+
+\textbf{Prediction range.}
+The geometric \sysname pipeline is fundamentally bounded by sensor range:
+nodes can only be sampled where depth/LiDAR returns and traversability
+inference are reliable, typically $\le 8$--$10$\,m. The end-to-end model
+inherits the Depth-Anything-V2 monocular prior, which extrapolates
+structure tens of metres beyond the active sensor's horizon, so the
+predicted graph fans well into the upper image. This yields denser
+long-range coverage from a single viewpoint (see the forward-most nodes
+in Fig.~\ref{fig:e2e_domains}\,b,\,f), reducing the number of viewpoints
+needed to span a given area at the cost of mild stochasticity in the far
+field.
+
+\textbf{Latency.}
+The geometric pipeline incurs sequential cost across depth estimation,
+traversability fusion, voxelised sampling, and edge construction. The
+ViT-S variant collapses all of these stages into a single network forward
+pass and a fixed GPU-resident merge step; with FP16 autocast and
+\texttt{torch.compile(reduce-overhead)}, it runs at lower latency than the
+geometric pipeline (Fig.~\ref{fig:e2e_latency}).
+
+\textbf{Graph quality and planning.}
+We quantify the geometric quality of the predicted graphs against a
+held-out GT occupancy map. The ViT-S backbone covers $88.4\%$ of the
+free area in the GT map (the fraction of free cells lying within a
+threshold radius of at least one predicted node), versus $84.1\%$ for
+ViT-B, indicating that the smaller backbone is less conservative at
+the same sampling threshold. Per-element failure rates against the
+GT occupancy are low and comparable across backbones: only $9.1\%$
+(ViT-B) and $10.6\%$ (ViT-S) of predicted nodes fall in non-traversable
+cells, and only $5.8\%$ and $8.0\%$ of edges pass through them. For
+downstream path planning, A* on the resulting graphs returns a fully
+free-space path for $98.0\%$ (ViT-B) and $97.5\%$ (ViT-S) of 200
+randomly sampled (start, goal) pairs in free space. Together, these
+results indicate that the connectivity produced by \sysname's
+per-frame edge builder is reliable for downstream navigation, at the
+cost of some per-node stochasticity.
+
+
+
+%===============================================================================
+
+\section{Conclusion}
+\label{sec:conclusion}
+We presented \sysname, an open-source, GPU-resident navigation graph
+library that unifies real-robot deployment and large-scale parallel
+learning under a single representation. By keeping every stage of the
+pipeline, frontier detection, waypoint sampling, global merging, edge
+construction, and graph search, on the GPU and behind a small set of
+stable-ID primitives, \sysname scales to graphs with hundreds of
+thousands of nodes and to dozens of parallel environments without
+losing real-time performance on a physical quadruped. Its extensible
+layer system lets geometric, semantic, and learned attributes share a
+single graph, and its loop-closure primitive corrects drift in a
+single vectorised pass without rebuilding any volumetric map. Built on
+top of this infrastructure, we trained the first end-to-end RGB-to-Graph
+model we are aware of that produces a 3-D navigation graph directly
+from a single posed RGB frame. It inherits the generalisation and
+long-range reach of a monocular foundation backbone while remaining
+cheap enough to deploy at sensor rate, and the graphs it builds support
+reliable path planning across diverse indoor and outdoor scenes. Together, the library and the learned
+predictor demonstrate that graphs can serve as a primary, first-class
+representation for mobile-robot autonomy rather than a static
+afterthought of a geometric mapping stack.
+
+\section{Limitations}
+\label{sec:limitations}
+As with many geometry-based methods, \sysname requires tuning of
+several hyperparameters. Additional open challenges remain. First,
+only nodes are learned by the RGB-to-Graph model; edges are still
+built per frame by a heatmap-validated geometric check, so edge
+correctness depends on heatmap quality and is not optimised
+end-to-end. Second, neither the geometric pipeline nor the learned
+predictor reasons about dynamic obstacles. Third, the learned graph
+is stochastic in the far field, and water reflections or glass doors
+can disrupt node sampling. Finally, although \sysname is designed
+for batched RL training, we have not yet trained a policy that
+consumes \sysname graphs as observations; doing so is the natural
+next step and would further validate the library's role as a
+learning substrate.
+
+
+
+
+%===============================================================================
+
+\clearpage
+% The acknowledgments are automatically included only in the final and preprint versions of the paper.
+\acknowledgments{If a paper is accepted, the final camera-ready version will (and probably should) include acknowledgments. All acknowledgments go at the end of the paper, including thanks to reviewers who gave useful comments, to colleagues who contributed to the ideas, and to funding agencies and corporate sponsors that provided financial support.}
+
+%===============================================================================
+
+% no \bibliographystyle is required, since the corl style is automatically used.
+\bibliography{references}  % .bib
+
+\end{document}

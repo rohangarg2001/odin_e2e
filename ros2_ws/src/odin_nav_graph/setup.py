@@ -53,6 +53,7 @@ setup(
         'console_scripts': [
             'nav_graph_node = odin_nav_graph.nav_graph_node:main',
             'nav_graph_node_e2e = odin_nav_graph.nav_graph_node_e2e:main',
+            'nav_graph_node_e2e_unfiltered = odin_nav_graph.nav_graph_node_e2e_unfiltered:main',
         ],
     },
 )

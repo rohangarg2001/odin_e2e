@@ -23,4 +23,6 @@ ros2 run odin_nav_graph nav_graph_node --ros-args \
   -p explorfm_radio_dim:=768 \
   -p explorfm_static_scale_factor:=0.5 \
   -p explorfm_precision:=FP16 \
-  -p explorfm_every_n_images:=1
+  -p explorfm_every_n_images:=1 \
+  -p frontier_score_mode:=window_max \
+  -p save_pipeline_viz:=true
