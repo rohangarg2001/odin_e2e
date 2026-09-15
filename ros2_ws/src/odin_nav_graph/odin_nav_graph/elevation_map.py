@@ -67,6 +67,7 @@ def _resolve_em_cupy_paths() -> tuple[Path, Path]:
     pkg_root = Path(elevation_mapping_cupy.__file__).resolve().parent
     candidates = [
         pkg_root / "config" / "core",
+        pkg_root.parent / "config" / "core",  # ROS2 source layout
         pkg_root.parent.parent / "config" / "core",
         Path(os.environ.get("ELEVATION_MAPPING_CUPY_CONFIG_DIR", "")) / "core",
     ]
@@ -94,8 +95,23 @@ class ElevationMapWrapper:
         sensor_noise_factor: float = 0.05,
         max_height_range: float = 1.5,
         recordable_fps: float = 0.0,
+        native_rows_axis: str = 'x',
     ):
         from elevation_mapping_cupy import ElevationMap, Parameter
+        import cupy as cp
+        from elevation_mapping_cupy.kernels import custom_kernels
+
+        # CuPy 14 no longer includes float16.cuh for float32 kernels.
+        # The mapper still uses float16 helpers in its generated preamble.
+        if int(cp.__version__.split('.')[0]) >= 14 and not getattr(custom_kernels, '_odin_half_header', False):
+            original_map_utils = custom_kernels.map_utils
+            def map_utils_with_half_header(*args, **kwargs):
+                return '#include <cupy/float16.cuh>\n' + original_map_utils(*args, **kwargs)
+            custom_kernels.map_utils = map_utils_with_half_header
+            custom_kernels._odin_half_header = True
+        if native_rows_axis not in ('x', 'y'):
+            raise ValueError('native_rows_axis must be x or y')
+        self.native_rows_axis = native_rows_axis
 
         weights_path, plugin_path = _resolve_em_cupy_paths()
         param = Parameter(
@@ -176,7 +192,9 @@ class ElevationMapWrapper:
         is_valid = self._map.get_layer("is_valid").get()
         elevation = np.asarray(elevation, dtype=np.float32).copy()
         elevation[is_valid == 0] = np.nan
-        return elevation[1:-1, 1:-1]
+        cropped = elevation[1:-1, 1:-1]
+        # Normalize ROS2 row-Y forks to this adapter's documented row-X layout.
+        return cropped.T if self.native_rows_axis == 'y' else cropped
 
     def get_elevation_for_navgraph(self) -> np.ndarray:
         """Return the elevation in nav_graph's expected convention

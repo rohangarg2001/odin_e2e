@@ -33,7 +33,8 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument('cloud_topic', default_value='/odin1/cloud_raw'),
         DeclareLaunchArgument('odom_topic', default_value='/odin1/odometry_highfreq'),
         DeclareLaunchArgument('frame_id', default_value='odom'),
-        DeclareLaunchArgument('robot_frame', default_value='odin1_base_link'),
+        DeclareLaunchArgument('robot_frame', default_value='imu'),
+        DeclareLaunchArgument('params_file', default_value=os.path.join(pkg_share, 'config', 'default_params.yaml')),
         DeclareLaunchArgument('map_length_xy', default_value='12.0'),
         DeclareLaunchArgument('map_resolution', default_value='0.10'),
         DeclareLaunchArgument('process_every_n', default_value='1'),
@@ -50,6 +51,7 @@ def generate_launch_description() -> LaunchDescription:
         output='screen',
         emulate_tty=True,
         parameters=[
+            LaunchConfiguration('params_file'),
             {
                 'cloud_topic': LaunchConfiguration('cloud_topic'),
                 'odom_topic': LaunchConfiguration('odom_topic'),
@@ -62,4 +64,10 @@ def generate_launch_description() -> LaunchDescription:
             }
         ],
     )
-    return LaunchDescription(args + [node])
+    rviz = Node(
+        package='rviz2', executable='rviz2',
+        arguments=['-d', LaunchConfiguration('rviz_config')],
+        parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time')}],
+        condition=IfCondition(LaunchConfiguration('rviz')),
+    )
+    return LaunchDescription(args + [node, rviz])

@@ -4,11 +4,20 @@ odin_nav_graph_node:
     cloud_topic: "/odin1/cloud_raw"
     odom_topic: "/odin1/odometry_highfreq"
     frame_id: "odom"
-    robot_frame: "odin1_base_link"
+    robot_frame: "imu"
+    cloud_frame: "lidar"
+    cloud_extrinsic_source: "tf"
+    sensor_tf_topic: "/odin1/tf"
+    # Supply calibration, or let the offline runner read /odin1/tf.
+    cloud_extrinsic_calibrated: false
+    cloud_to_robot_translation: [0.0, 0.0, 0.0]
+    cloud_to_robot_quaternion: [0.0, 0.0, 0.0, 1.0]
 
     # Rolling elevation map (elevation_mapping_cupy, in odom frame)
     map_length_xy: 12.0          # meters; map is square (length x length)
     map_resolution: 0.10         # meters / cell
+    # Local ROS2 mapper fork uses rows=Y. Legacy mapper backends may need row_x.
+    elevation_native_rows_axis: "row_y"
     cloud_max_range: 8.0         # drop points further than this from the sensor (meters)
     sensor_noise_factor: 0.05    # noise = factor * z^2 inside elevation_mapping_cupy
     em_position_noise: 0.0       # extra translational uncertainty per integrate()
@@ -41,6 +50,8 @@ odin_nav_graph_node:
 
     # Throttling / publishing
     process_every_n: 1
+    max_cloud_frames: 0
+    viz_z_offset: 0.0
     publish_elevation_cloud: true
     publish_edges: true
-    max_edges_published: 5000
+    max_edges_published: 100000

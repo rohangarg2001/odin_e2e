@@ -2,9 +2,9 @@
 """ROS2 node that builds a navigation graph from /odin1/cloud_raw using nav_graph_gpu.
 
 Pipeline per cloud message:
-    1. Parse PointCloud2 -> (N, 3) xyz in odin1_base_link.
+    1. Parse PointCloud2 -> (N, 3) xyz in the configured cloud frame.
     2. Find the closest /odin1/odometry_highfreq message in time and use its
-       pose to transform points into the odom frame.
+       pose and the synchronized LiDAR extrinsic to transform points into odom.
     3. Move the rolling elevation map to the robot's current xy and project
        the transformed points into it (max-z aggregation).
     4. Hand the elevation map to NavigationGraphBuilder
@@ -41,6 +41,7 @@ from rclpy.node import Node
 
 from sensor_msgs.msg import PointCloud2, PointField, Image, CameraInfo
 from nav_msgs.msg import Odometry
+from tf2_msgs.msg import TFMessage
 from std_msgs.msg import Header
 from visualization_msgs.msg import Marker
 from geometry_msgs.msg import Point
@@ -386,11 +387,19 @@ class OdinNavGraphNode(Node):
         self.declare_parameter('cloud_topic', '/odin1/cloud_raw')
         self.declare_parameter('odom_topic', '/odin1/odometry_highfreq')
         self.declare_parameter('frame_id', 'odom')
-        self.declare_parameter('robot_frame', 'odin1_base_link')
+        self.declare_parameter('robot_frame', 'imu')
+        self.declare_parameter('cloud_frame', 'lidar')
+        # T_robot_from_cloud. Supply sensor calibration when frames differ.
+        self.declare_parameter('cloud_to_robot_translation', [0.0, 0.0, 0.0])
+        self.declare_parameter('cloud_to_robot_quaternion', [0.0, 0.0, 0.0, 1.0])
+        self.declare_parameter('cloud_extrinsic_calibrated', False)
+        self.declare_parameter('cloud_extrinsic_source', 'tf')
+        self.declare_parameter('sensor_tf_topic', '/odin1/tf')
 
         # Elevation map geometry
         self.declare_parameter('map_length_xy', 12.0)
         self.declare_parameter('map_resolution', 0.10)
+        self.declare_parameter('elevation_native_rows_axis', 'row_y')
         self.declare_parameter('cloud_max_range', 8.0)
         self.declare_parameter('sensor_noise_factor', 0.05)
         self.declare_parameter('em_position_noise', 0.0)
@@ -422,7 +431,7 @@ class OdinNavGraphNode(Node):
 
         # Throttling / publishing
         self.declare_parameter('process_every_n', 1)
-        self.declare_parameter('max_cloud_frames', 385)   # 0 = unlimited; stop graph updates after N frames
+        self.declare_parameter('max_cloud_frames', 0)   # 0 = unlimited
         self.declare_parameter('publish_elevation_cloud', True)
         self.declare_parameter('publish_edges', True)
         self.declare_parameter('max_edges_published', 100000)
@@ -440,7 +449,7 @@ class OdinNavGraphNode(Node):
         # (graph_nodes, frontier_cloud, graph_edges) so they sit clearly
         # above the SLAM cloud / elevation cloud in RViz.  Stored Z in
         # the global graph is unchanged.
-        self.declare_parameter('viz_z_offset', 0.45)
+        self.declare_parameter('viz_z_offset', 0.0)
 
         # RGB + graph saver
         self.declare_parameter('out_directory', '')
@@ -468,6 +477,18 @@ class OdinNavGraphNode(Node):
         odom_topic = gp('odom_topic')
         self.frame_id = gp('frame_id')
         self.robot_frame = gp('robot_frame')
+        self.cloud_frame = gp('cloud_frame')
+        self.cloud_extrinsic_source = str(gp('cloud_extrinsic_source'))
+        if self.cloud_extrinsic_source not in ('tf', 'parameters'):
+            raise ValueError('cloud_extrinsic_source must be tf or parameters')
+        if (self.cloud_extrinsic_source == 'parameters' and
+                self.cloud_frame != self.robot_frame and not gp('cloud_extrinsic_calibrated')):
+            raise ValueError('Different cloud/odometry frames require a measured '
+                             'cloud-to-robot transform and cloud_extrinsic_calibrated:=true')
+        self._T_robot_from_cloud = _pq_to_se3(
+            np.asarray(gp('cloud_to_robot_translation'), dtype=np.float64),
+            np.asarray(gp('cloud_to_robot_quaternion'), dtype=np.float64),
+        )
 
         length_xy = float(gp('map_length_xy'))
         res = float(gp('map_resolution'))
@@ -530,6 +551,7 @@ class OdinNavGraphNode(Node):
         # ── Rolling elevation map (elevation_mapping_cupy) ────────────
         self.get_logger().info('Initialising ElevationMap (elevation_mapping_cupy)...')
         self.emap = ElevationMapWrapper(
+            native_rows_axis=str(gp('elevation_native_rows_axis')).removeprefix('row_'),
             map_length=length_xy,
             resolution=res,
             sensor_noise_factor=sensor_noise_factor,
@@ -542,6 +564,7 @@ class OdinNavGraphNode(Node):
 
         # ── State ─────────────────────────────────────────────────────
         self.odom_buf: deque[Tuple[float, Odometry]] = deque()
+        self.extrinsic_buf = deque()
         self.frame_count = 0
         self.last_robot_xy: Optional[Tuple[float, float]] = None
         self.last_robot_yaw: float = 0.0
@@ -549,6 +572,8 @@ class OdinNavGraphNode(Node):
         # ── Subscribers ───────────────────────────────────────────────
         self.create_subscription(Odometry, odom_topic, self.odom_callback, 100)
         self.create_subscription(PointCloud2, cloud_topic, self.cloud_callback, 5)
+        if self.cloud_extrinsic_source == 'tf':
+            self.create_subscription(TFMessage, str(gp('sensor_tf_topic')), self.sensor_tf_callback, 100)
 
         # ── Publishers ────────────────────────────────────────────────
         self.elev_pub = self.create_publisher(PointCloud2, '~/elevation_cloud', 1)
@@ -614,6 +639,17 @@ class OdinNavGraphNode(Node):
     #  Callbacks
     # ──────────────────────────────────────────────────
 
+    def sensor_tf_callback(self, msg: TFMessage) -> None:
+        for transform in msg.transforms:
+            if (transform.header.frame_id, transform.child_frame_id) != (self.robot_frame, self.cloud_frame):
+                continue
+            t = stamp_to_sec(transform.header.stamp)
+            p, q = transform.transform.translation, transform.transform.rotation
+            self.extrinsic_buf.append((t, _pq_to_se3(
+                np.array([p.x, p.y, p.z]), np.array([q.x, q.y, q.z, q.w]))))
+            while self.extrinsic_buf and self.extrinsic_buf[0][0] < t - self.odom_buffer_seconds:
+                self.extrinsic_buf.popleft()
+
     def odom_callback(self, msg: Odometry) -> None:
         t = stamp_to_sec(msg.header.stamp)
         self.odom_buf.append((t, msg))
@@ -639,19 +675,25 @@ class OdinNavGraphNode(Node):
         self.frame_count += 1
         if self.max_cloud_frames > 0 and self.frame_count > self.max_cloud_frames:
             return
-        if self._out_dir is not None and self._rgb_count > self._save_frame_end:
-            return
         if self.process_every_n > 1 and (self.frame_count % self.process_every_n) != 0:
             return
 
-        if msg.header.frame_id != self.robot_frame:
+        if msg.header.frame_id != self.cloud_frame:
             self.get_logger().warn(
                 f'cloud frame_id={msg.header.frame_id!r} != expected '
-                f'{self.robot_frame!r}; transform may be wrong.',
+                f'{self.cloud_frame!r}; rejecting cloud.',
                 throttle_duration_sec=5.0,
             )
+            return
 
         t_cloud = stamp_to_sec(msg.header.stamp)
+        if self.cloud_extrinsic_source == 'tf' and self.cloud_frame != self.robot_frame:
+            nearest = min(self.extrinsic_buf, key=lambda item: abs(item[0]-t_cloud), default=None)
+            if nearest is None or abs(nearest[0]-t_cloud) > self.odom_match_max_dt:
+                self.get_logger().warn('No synchronized cloud-to-robot transform; rejecting cloud.',
+                                       throttle_duration_sec=2.0)
+                return
+            self._T_robot_from_cloud = nearest[1]
         odom = self._find_pose_at(t_cloud)
         if odom is None:
             self.get_logger().warn(
@@ -661,13 +703,13 @@ class OdinNavGraphNode(Node):
             )
             return
 
-        if odom.header.frame_id and odom.header.frame_id != self.frame_id:
-            # We assume odom is published in the configured world frame.  Just warn.
+        if odom.header.frame_id != self.frame_id or odom.child_frame_id != self.robot_frame:
             self.get_logger().warn(
-                f'odom header frame_id={odom.header.frame_id!r} != '
-                f'{self.frame_id!r}; treating odom pose as world-frame anyway.',
+                f'Expected odometry {self.frame_id}->{self.robot_frame}, got '
+                f'{odom.header.frame_id}->{odom.child_frame_id}; rejecting cloud.',
                 throttle_duration_sec=10.0,
             )
+            return
 
         try:
             self._process(msg, odom)
@@ -684,11 +726,13 @@ class OdinNavGraphNode(Node):
     # ──────────────────────────────────────────────────
 
     def _process(self, msg: PointCloud2, odom: Odometry) -> None:
-        # Pose: world (odom) <- base_link.  Apply to base-frame points.
+        # Pose: world <- odometry child. Compose the LiDAR calibration below.
         p = odom.pose.pose.position
         q = odom.pose.pose.orientation
         rot = quat_to_rot(q.x, q.y, q.z, q.w)
         trans = np.array([p.x, p.y, p.z], dtype=np.float32)
+        sensor_rot = rot @ self._T_robot_from_cloud[:3, :3]
+        sensor_trans = trans + rot @ self._T_robot_from_cloud[:3, 3]
 
         # Yaw in odom: project the base x-axis onto the world XY plane.
         # Robust to tilt — better than the flat-quat formula when there's
@@ -723,8 +767,8 @@ class OdinNavGraphNode(Node):
         self.emap.move_to(np.array([trans[0], trans[1], 0.0], dtype=np.float32))
         self.emap.integrate(
             xyz_base,
-            t_sensor_in_odom=trans,
-            R_sensor_to_odom=rot,
+            t_sensor_in_odom=sensor_trans,
+            R_sensor_to_odom=sensor_rot,
             position_noise=self.em_position_noise,
             orientation_noise=self.em_orientation_noise,
         )
@@ -752,6 +796,7 @@ class OdinNavGraphNode(Node):
             compute_layers=True,
         )
         t_graph = (time.perf_counter() - t0) * 1000.0
+        self._last_timings = {'parse': t_parse, 'elevation': t_emap, 'graph': t_graph}
         self._last_result = result
 
         n_frontiers = (
@@ -840,12 +885,16 @@ class OdinNavGraphNode(Node):
 
     def _publish_graph_nodes(self, result, stamp) -> None:
         if result.num_nodes == 0:
+            self.graph_pub.publish(self._make_xyz_intensity_cloud(
+                np.empty((0, 3)), np.empty(0), stamp))
             return
         # Only free-space nodes go on /graph_nodes — frontier nodes are
         # published separately to /frontier_cloud so they can be styled
         # differently in RViz without overlap.
         free_mask = result.node_types == 1
         if not bool(free_mask.any().item()):
+            self.graph_pub.publish(self._make_xyz_intensity_cloud(
+                np.empty((0, 3)), np.empty(0), stamp))
             return
         positions = result.node_positions[free_mask].cpu().numpy().astype(np.float32, copy=True)
         positions[:, 2] += self.viz_z_offset
@@ -854,9 +903,13 @@ class OdinNavGraphNode(Node):
 
     def _publish_frontier_cloud(self, result, stamp) -> None:
         if result.num_nodes == 0:
+            self.frontier_pub.publish(self._make_xyz_intensity_cloud(
+                np.empty((0, 3)), np.empty(0), stamp))
             return
         mask = result.node_types == 2
         if not bool(mask.any().item()):
+            self.frontier_pub.publish(self._make_xyz_intensity_cloud(
+                np.empty((0, 3)), np.empty(0), stamp))
             return
         positions = result.node_positions[mask].cpu().numpy().astype(np.float32, copy=True)
         positions[:, 2] += self.viz_z_offset
@@ -872,6 +925,12 @@ class OdinNavGraphNode(Node):
 
     def _publish_edges(self, result, stamp) -> None:
         if result.num_nodes == 0 or result.num_edges == 0:
+            m = Marker()
+            m.header = Header(stamp=stamp, frame_id=self.frame_id)
+            m.ns = 'nav_graph_edges'
+            m.id = 0
+            m.action = Marker.DELETE
+            self.edges_pub.publish(m)
             return
         positions = result.node_positions.cpu().numpy().astype(np.float32, copy=True)
         positions[:, 2] += self.viz_z_offset
@@ -884,7 +943,7 @@ class OdinNavGraphNode(Node):
         id_to_idx[ids.astype(np.int64)] = np.arange(ids.shape[0], dtype=np.int64)
 
         if edge_index.shape[0] > self.max_edges_published:
-            stride = max(1, edge_index.shape[0] // self.max_edges_published)
+            stride = max(1, math.ceil(edge_index.shape[0] / self.max_edges_published))
             edge_index = edge_index[::stride]
 
         src_idx = id_to_idx[edge_index[:, 0].astype(np.int64)]
